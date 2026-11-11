@@ -8,6 +8,7 @@ pub mod agent;
 pub mod checks;
 pub mod classify;
 pub mod engine;
+pub mod eval;
 pub mod hook;
 pub mod layer;
 pub mod objects;

@@ -205,6 +205,11 @@ enum Cmd {
     },
     /// Verify every event id on a branch against its content
     Verify,
+    /// Measure: mine tasks from a repo's history, run them under several modes, report
+    Eval {
+        #[command(subcommand)]
+        cmd: EvalCmd,
+    },
     /// Check what works on this machine: git, namespaces, overlays, RUNE_HOME, the model endpoint
     Doctor,
     /// Print hook configuration for a harness
@@ -212,6 +217,131 @@ enum Cmd {
         #[arg(value_parser = ["claude", "kiro"])]
         harness: String,
     },
+}
+
+#[derive(Subcommand)]
+enum EvalCmd {
+    /// Commits that change code and tests become tasks (start at the parent, tests held out)
+    Mine {
+        repo: PathBuf,
+        #[arg(long, default_value = "eval/tasks")]
+        out: PathBuf,
+        /// Commits to look at, newest first
+        #[arg(long, default_value_t = 300)]
+        limit: usize,
+        /// Skip commits with a bigger code change (lines added + removed, tests excluded)
+        #[arg(long, default_value_t = 300)]
+        max_code_lines: u64,
+    },
+    /// Run tasks (files or directories of *.json) under each mode, in isolated copies; resumable
+    Run {
+        #[arg(required = true)]
+        tasks: Vec<PathBuf>,
+        /// plain, checks, rollback, search (comma-separated)
+        #[arg(long, default_value = "plain,checks")]
+        modes: String,
+        #[arg(long, default_value_t = 1)]
+        runs: usize,
+        /// Cells run in parallel
+        #[arg(long, default_value_t = 2)]
+        jobs: usize,
+        #[arg(long, default_value = "eval/out")]
+        out: PathBuf,
+        /// Attempts per search when a task names no hypotheses
+        #[arg(long, default_value_t = 2)]
+        width: usize,
+        /// Scripted model instead of a real one: DIR/<task>.json (DIR/<task>.attempt-<i>.json in search)
+        #[arg(long)]
+        script: Option<PathBuf>,
+        #[arg(long)]
+        api: Option<String>,
+        #[arg(long)]
+        base_url: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        effort: Option<String>,
+        #[arg(long, value_enum, default_value = "dry")]
+        mode: PermArg,
+    },
+    /// Rewrite report.md / report.json from the results in OUT
+    Report {
+        #[arg(default_value = "eval/out")]
+        out: PathBuf,
+    },
+}
+
+fn task_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut v = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let mut fs: Vec<PathBuf> = std::fs::read_dir(p)?.flatten().map(|e| e.path()).filter(|f| f.extension().is_some_and(|x| x == "json")).collect();
+            fs.sort();
+            v.extend(fs);
+        } else {
+            v.push(p.clone());
+        }
+    }
+    Ok(v)
+}
+
+fn eval_cmd(cmd: &EvalCmd) -> Result<()> {
+    use runestone::eval;
+    match cmd {
+        EvalCmd::Mine { repo, out, limit, max_code_lines } => {
+            let tasks = eval::mine(repo, &eval::MineOpts { limit: *limit, max_code_lines: *max_code_lines })?;
+            std::fs::create_dir_all(out)?;
+            for t in &tasks {
+                std::fs::write(out.join(format!("{}.json", t.name)), serde_json::to_string_pretty(t)? + "\n")?;
+                println!("{}  {}", t.name, t.prompt.lines().next().unwrap_or(""));
+            }
+            eprintln!("{} tasks in {}", tasks.len(), out.display());
+        }
+        EvalCmd::Run { tasks, modes, runs, jobs, out, width, script, api, base_url, model, effort, mode } => {
+            let tasks: Vec<eval::Task> = task_files(tasks)?.iter().map(|p| eval::Task::load(p)).collect::<Result<_>>()?;
+            let modes: Vec<eval::Mode> = modes.split(',').map(|m| eval::Mode::parse(m.trim())).collect::<Result<_>>()?;
+            let api = api.clone().or_else(|| std::env::var("RUNE_API").ok()).unwrap_or_else(|| "anthropic".into());
+            let base_url = base_url.clone().or_else(|| std::env::var("RUNE_BASE_URL").ok());
+            if script.is_none() {
+                agent_cli::provider(&api, base_url.as_deref())?; // fail early on a missing key or URL
+            }
+            let config = runestone::agent::Config {
+                api: api.clone(),
+                model: model.clone().or_else(|| std::env::var("RUNE_MODEL").ok()).unwrap_or_else(|| "claude-opus-5-5".into()),
+                effort: effort.clone(),
+                ..Default::default()
+            };
+            let perm = match mode {
+                PermArg::Ask => runestone::agent::Permission::Ask,
+                PermArg::Dry => runestone::agent::Permission::Dry,
+                PermArg::Auto => runestone::agent::Permission::Auto,
+            };
+            let out = std::path::absolute(out)?;
+            let opts = eval::RunOpts { modes, runs: *runs, jobs: *jobs, out: out.clone(), perm, config, search_width: *width };
+            let script = script.clone();
+            let providers = move |t: &eval::Task, m: eval::Mode, _run: usize, attempt: usize| -> Result<Box<dyn runestone::agent::model::Provider>> {
+                match &script {
+                    Some(dir) => {
+                        let per = dir.join(format!("{}.attempt-{attempt}.json", t.name));
+                        let file = if m == eval::Mode::Search && per.exists() { per } else { dir.join(format!("{}.json", t.name)) };
+                        Ok(Box::new(runestone::agent::model::Scripted::from_file(&file)?))
+                    }
+                    None => agent_cli::provider(&api, base_url.as_deref()),
+                }
+            };
+            let t0 = Instant::now();
+            let results = eval::run(&tasks, &opts, &providers)?;
+            let md = eval::write_report(&out, &results)?;
+            print!("{}", eval::markdown(&results));
+            eprintln!("{} cells in {:.1}s; report: {}", results.len(), t0.elapsed().as_secs_f64(), md.display());
+        }
+        EvalCmd::Report { out } => {
+            let results = eval::load_results(out)?;
+            eval::write_report(out, &results)?;
+            print!("{}", eval::markdown(&results));
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -225,7 +355,12 @@ fn main() {
             .map(|s| s.success())
             .unwrap_or(false)
     };
-    if matches!(cli.cmd, Cmd::Search { .. }) && !runestone::layer::in_namespace() && ns_ok() {
+    let wants_overlay = match &cli.cmd {
+        Cmd::Search { .. } => true,
+        Cmd::Eval { cmd: EvalCmd::Run { modes, .. } } => modes.contains("search"),
+        _ => false,
+    };
+    if wants_overlay && !runestone::layer::in_namespace() && ns_ok() {
         let exe = std::env::current_exe().expect("own path");
         let status = std::process::Command::new("unshare")
             .args(["--user", "--map-root-user", "--mount"])
@@ -277,6 +412,9 @@ fn run(cli: Cli) -> Result<()> {
             println!("{:?}/{:?}  {}", c.state, c.disclosure, c.reason);
         }
         return Ok(());
+    }
+    if let Cmd::Eval { cmd } = &cli.cmd {
+        return eval_cmd(cmd);
     }
     if let Cmd::Doctor = &cli.cmd {
         std::process::exit(doctor::run());
@@ -548,7 +686,7 @@ fn run(cli: Cli) -> Result<()> {
             let ev = eng.record_tree(&branch, "check", &tree, json!({ "cmd": cmd, "exit": r.exit, "score": r.score, "cached": r.cached, "duration_ms": r.duration_ms, "output": r.tail }))?;
             println!("{} {} (passed {}, failed {}, {}){}", if r.score.green { "✓" } else { "✗" }, cmd, r.score.passed, r.score.failed, if r.cached { "cached".into() } else { format!("{} ms", r.duration_ms) }, format!("  [{}]", ev.short()));
         }
-        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Doctor | Cmd::Chat { .. } | Cmd::Run { .. } | Cmd::Search { .. } | Cmd::Models { .. } => unreachable!(),
+        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Doctor | Cmd::Eval { .. } | Cmd::Chat { .. } | Cmd::Run { .. } | Cmd::Search { .. } | Cmd::Models { .. } => unreachable!(),
     }
     Ok(())
 }

@@ -66,6 +66,22 @@ process: 26 ms per step vs 101 ms on the scan world with one attempt, 88 ms per 
 2 cores (≈160 steps/s in aggregate once the base exists). Materializing the base tree (0.6–5 s for 20k files)
 now dominates a search's start.
 
+## Measurement (`rune eval`)
+
+```sh
+rune eval mine . --out eval/tasks             # commits that change code + tests → tasks (tests held out)
+rune eval run eval/tasks --modes plain,checks,rollback,search --runs 3 --jobs 2 --out eval/out
+rune eval report eval/out                      # report.md + report.json from the per-cell results
+```
+
+A task is a starting tree (a repo at a commit, or a directory), a prompt, an optional visible check, and
+hidden tests (inline files, a directory, or paths from a commit) laid over the final tree only to score it.
+The miner starts each task at the commit's parent, uses the commit message as the prompt, and runs exactly
+the commit's test files (`cargo test --offline -p … --test …`, pytest paths, …). Each (task, mode, run) cell
+runs in its own copy; results are written per cell, so a run resumes where it stopped. Search mode selects
+by the visible check only: the hidden tests never steer, they only score. On rune's own history the miner
+finds 6 tasks; with an idle model, the held-out test is what fails.
+
 ## Versioned world
 
 ```
