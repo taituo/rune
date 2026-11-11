@@ -1,4 +1,5 @@
 mod agent_cli;
+mod doctor;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -204,6 +205,8 @@ enum Cmd {
     },
     /// Verify every event id on a branch against its content
     Verify,
+    /// Check what works on this machine: git, namespaces, overlays, RUNE_HOME, the model endpoint
+    Doctor,
     /// Print hook configuration for a harness
     Install {
         #[arg(value_parser = ["claude", "kiro"])]
@@ -274,6 +277,9 @@ fn run(cli: Cli) -> Result<()> {
             println!("{:?}/{:?}  {}", c.state, c.disclosure, c.reason);
         }
         return Ok(());
+    }
+    if let Cmd::Doctor = &cli.cmd {
+        std::process::exit(doctor::run());
     }
     if let Cmd::Install { harness } = &cli.cmd {
         install(harness);
@@ -542,7 +548,7 @@ fn run(cli: Cli) -> Result<()> {
             let ev = eng.record_tree(&branch, "check", &tree, json!({ "cmd": cmd, "exit": r.exit, "score": r.score, "cached": r.cached, "duration_ms": r.duration_ms, "output": r.tail }))?;
             println!("{} {} (passed {}, failed {}, {}){}", if r.score.green { "✓" } else { "✗" }, cmd, r.score.passed, r.score.failed, if r.cached { "cached".into() } else { format!("{} ms", r.duration_ms) }, format!("  [{}]", ev.short()));
         }
-        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Chat { .. } | Cmd::Run { .. } | Cmd::Search { .. } | Cmd::Models { .. } => unreachable!(),
+        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Doctor | Cmd::Chat { .. } | Cmd::Run { .. } | Cmd::Search { .. } | Cmd::Models { .. } => unreachable!(),
     }
     Ok(())
 }

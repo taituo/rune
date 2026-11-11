@@ -6,15 +6,15 @@ note. Stop at the first step that fails and report it.
 
 ## 0. Setup (10 min)
 
-Linux with Rust, git ≥ 2.38, python3 and util-linux.
+Linux with Rust, git ≥ 2.40, python3 and util-linux.
 
 ```sh
 git clone https://github.com/taituo/rune && cd rune
 cargo build --release && cargo test          # 24 tests; namespace tests skip themselves if unsupported
-unshare --user --map-root-user --mount true && echo namespaces-ok   # needed for search and offline mode
 export PATH="$PWD/target/release:$PATH"
 export ANTHROPIC_API_KEY=…                    # in your shell only, never in a chat
 scripts/fixtures.sh ~/rune-fixtures           # calc, calc-hidden, trap
+rune doctor                                   # what works on this machine, and the fix for each gap
 ```
 
 Optional: `export RUNE_HOME=~/rune-test-home` keeps the test record apart from real use.
@@ -30,15 +30,11 @@ export RUNE_MODEL=<id>
 
 The API is fixed per session (stored at its start), so `rune chat -r` keeps using the gateway.
 
-**If `unshare … true` fails** (`write failed /proc/self/uid_map: Operation not permitted`), unprivileged user
-namespaces are blocked: usually Ubuntu's AppArmor setting, or running inside a container. Then:
-
-- steps 1–4 still work, but use `--mode ask` or `--mode auto`: without the offline sandbox, dry mode blocks every
-  command rune cannot classify, including `python3 test_visible.py`;
-- step 5 (search) still works, with plain directory copies as forks instead of overlays. It prints a line saying
-  so. Copies cost more on big trees (about 0.6 s per attempt for 20k files), and a shell command that reaches the
-  main worktree through an indirect path (a path read from a file) is not contained. To get overlay forks on
-  Ubuntu: `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` (until reboot).
+**Read `rune doctor`'s warnings before step 1.** Where it says user namespaces are blocked (usually Ubuntu's
+AppArmor setting, or a container), steps 1–4 still work with `--mode ask` or `--mode auto` (dry mode blocks
+every command it cannot classify without the offline sandbox), and step 5 runs with directory copies as forks:
+slower on big trees, and a shell command that reaches the main worktree through an indirect path is not
+contained. Doctor prints the sysctl that turns overlays on.
 
 `RUNE_REQUIRE_NS=1 cargo test` fails instead of skipping where namespaces are missing.
 

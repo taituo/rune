@@ -8,6 +8,7 @@ conversation is a fold over the same events, so a rewind or fork moves the messa
 
 ```sh
 export ANTHROPIC_API_KEY=…        # or: RUNE_API=openai RUNE_BASE_URL=http://gateway:8788 (chat/completions)
+rune doctor                       # what works on this machine (git, namespaces, overlays, model endpoint)
 rune chat                         # new session (default mode: ask before outside-world actions)
 rune chat -r                      # resume the latest session in this worktree
 rune run "fix the failing test"   # one request, then exit (default mode: dry)
