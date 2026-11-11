@@ -1,0 +1,17 @@
+[package]
+name = "runestone"
+description = "Versioned-world engine: event DAG, world snapshots, attribution, keep-human rewind"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
