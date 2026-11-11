@@ -314,3 +314,31 @@ fn in_process_diff_matches_git_numstat() {
     git.sort_by(|a, b| a.split('\t').nth(3).cmp(&b.split('\t').nth(3)));
     assert_eq!(ours, git);
 }
+
+#[test]
+fn two_sessions_in_one_worktree_do_not_collide() {
+    // Two engines over the same worktree (two `rune chat` processes) snapshot concurrently.
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    for i in 0..200 {
+        fs::write(wt.path().join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+    }
+    let errors = std::sync::atomic::AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for t in 0..4 {
+            let (home, wt, errors) = (home.path(), wt.path(), &errors);
+            s.spawn(move || {
+                let eng = Engine::open_in(home, wt).unwrap();
+                let b = eng.branch(&format!("s/{t}"));
+                for k in 0..15 {
+                    fs::write(wt.join(format!("t{t}.txt")), format!("{k}\n")).unwrap();
+                    if let Err(e) = eng.record(&b, "manual", json!({})) {
+                        eprintln!("thread {t}: {e:#}");
+                        errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(errors.load(std::sync::atomic::Ordering::Relaxed), 0, "concurrent snapshots failed");
+}

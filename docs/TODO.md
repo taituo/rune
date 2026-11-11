@@ -65,7 +65,7 @@ design notes doc ("rune: design notes, deep pass").
       path would be followed to the live tree.
 - [ ] Per-hunk parking instead of whole-file parking on conflict.
 - [ ] Rewind plan reports excluded paths that changed (cannot be restored).
-- [ ] Two sessions in one worktree share the shadow index: lock or separate it.
+- [x] Two sessions in one worktree share the shadow index: per-worktree flock around init, snapshot, checkout (M1.6).
 - [ ] Per-call cgroups + fanotify so background writers (`npm run dev &`) stay attributed.
 - [ ] Mechanical changes (formatters) detected by re-running the tool; re-derived on rewind instead of merged.
 - [x] Ctrl-C interrupts a turn: the running command's process group is killed, remaining tool calls get

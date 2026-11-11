@@ -81,7 +81,10 @@ impl World {
         let odb = crate::objects::Odb::new(&git_dir);
         let w = World { worktree, git_dir, key, index_path, layer: None, hashes: Default::default(), alias: None, odb };
         if !w.git_dir.join("HEAD").exists() {
-            w.init()?;
+            let _l = w.lock()?;
+            if !w.git_dir.join("HEAD").exists() {
+                w.init()?;
+            }
         }
         Ok(w)
     }
@@ -135,12 +138,29 @@ impl World {
         run(self.cmd(index, work_tree).args(args))
     }
 
+    /// Exclusive lock for this worktree's shadow repo and index. Two rune processes (or threads) on the
+    /// same worktree take turns instead of colliding on git's index.lock. Released when dropped.
+    pub(crate) fn lock(&self) -> Result<std::fs::File> {
+        let path = self.git_dir.with_extension("lock");
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+        f.lock()?;
+        Ok(f)
+    }
+
     /// Snapshot the live worktree. Unchanged tree = same id, no new objects. A layered fork reads only its
     /// upper layer, so the cost follows the changes, not the size of the tree.
     pub fn snapshot(&self) -> Result<String> {
         if self.layer.is_some() {
             return self.layered_snapshot();
         }
+        let _l = self.lock()?;
+        self.snapshot_locked()
+    }
+
+    fn snapshot_locked(&self) -> Result<String> {
         self.git(&["add", "-A", "--ignore-errors", "."]).or_else(|_| self.git(&["add", "-A", "."]))?;
         Ok(self.git(&["write-tree"])?.trim().to_string())
     }
@@ -222,7 +242,15 @@ impl World {
     /// written fresh, so their mtimes are "now": build tools see restored sources as newer than old
     /// artifacts and rebuild. Excluded paths are never touched.
     pub fn checkout(&self, tree: &str) -> Result<String> {
-        let live = self.snapshot()?;
+        if self.layer.is_some() {
+            let live = self.snapshot()?;
+            if live != tree {
+                self.git(&["read-tree", "-m", "-u", &live, tree])?;
+            }
+            return Ok(live);
+        }
+        let _l = self.lock()?;
+        let live = self.snapshot_locked()?;
         if live != tree {
             self.git(&["read-tree", "-m", "-u", &live, tree])?;
         }
