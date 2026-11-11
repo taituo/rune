@@ -69,6 +69,11 @@ pub fn fold(store: &Store, chain: &[Event]) -> Result<Folded> {
                     m.user(blocks);
                 }
             }
+            "check" => {
+                if let Some(n) = ev.str("note") {
+                    m.user(vec![json!({ "type": "text", "text": n })]);
+                }
+            }
             "world.rewind" => {
                 if let Some(n) = ev.str("note") {
                     m.user(vec![json!({ "type": "text", "text": n })]);

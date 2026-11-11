@@ -47,6 +47,7 @@ pub trait Ui {
     fn note(&mut self, t: &str) {}
     fn retry(&mut self, t: &str) {}
     fn usage(&mut self, usage: &Value) {}
+    fn check(&mut self, result: &crate::checks::CheckResult) {}
     fn ask(&mut self, question: &str) -> bool {
         false
     }
@@ -68,7 +69,21 @@ pub struct Session<'a> {
     pub ui: Box<dyn Ui + 'a>,
     pub perm: Permission,
     pub max_steps: usize,
+    pub checks: Option<Checks>,
 }
+
+/// Automatic checks at stable points: the end of every turn that changed files, and mid-turn after
+/// `every` file-changing tool calls (0 = only at turn end).
+#[derive(Debug, Clone)]
+pub struct Checks {
+    pub cmd: String,
+    pub every: usize,
+    /// Restore the best checked state after this many consecutive worse results (0 = never).
+    pub rollback_after: usize,
+    pub timeout: std::time::Duration,
+}
+
+const MAX_ROLLBACKS: usize = 3;
 
 /// Render the exact request for the conversation at the end of `chain`.
 pub fn render(store: &Store, chain: &[Event]) -> Result<Vec<u8>> {
@@ -151,6 +166,8 @@ impl<'a> Session<'a> {
     /// Continue from the current head (after a crash, or after a rewind the human applied).
     pub fn run_loop(&mut self) -> Result<TurnResult> {
         let tmp = self.eng.home.join("tmp");
+        let mut since_check = 0usize; // file-changing calls since the last check
+        let mut dirty = false; // files changed since the last check
         for step in 1..=self.max_steps {
             let chain = self.chain()?;
             let folded = fold(&self.eng.store, &chain)?;
@@ -195,6 +212,13 @@ impl<'a> Session<'a> {
             }
             if uses.is_empty() {
                 self.eng.record(&self.branch, "turn.end", json!({ "stop": stop }))?;
+                if dirty && self.checks.is_some() {
+                    dirty = false;
+                    since_check = 0;
+                    if self.run_check()? {
+                        continue; // rolled back to the best state: keep working from there
+                    }
+                }
                 return Ok(TurnResult { text, steps: step, stop });
             }
             let mut ctx = tools::Ctx { worktree: self.eng.world.worktree.clone(), tmp: tmp.clone(), seen: folded.seen, offline: false };
@@ -211,14 +235,24 @@ impl<'a> Session<'a> {
                         }
                     }
                 }
-                self.call_tool(&mut ctx, id, name, input)?;
+                if self.call_tool(&mut ctx, id, name, input)? {
+                    since_check += 1;
+                    dirty = true;
+                }
+            }
+            let every = self.checks.as_ref().map(|c| c.every).unwrap_or(0);
+            if every > 0 && since_check >= every {
+                since_check = 0;
+                dirty = false;
+                self.run_check()?;
             }
         }
         self.eng.record(&self.branch, "turn.end", json!({ "stop": "max_steps" }))?;
         Ok(TurnResult { text: format!("Stopped after {} steps.", self.max_steps), steps: self.max_steps, stop: "max_steps".into() })
     }
 
-    fn call_tool(&mut self, ctx: &mut tools::Ctx, id: &str, name: &str, input: &Value) -> Result<()> {
+    /// Run one tool call. Returns whether it changed files.
+    fn call_tool(&mut self, ctx: &mut tools::Ctx, id: &str, name: &str, input: &Value) -> Result<bool> {
         let sum = summary(name, input);
         let mut class = classify::tool(name, input);
         if matches!(name, "Write" | "Edit") {
@@ -231,7 +265,7 @@ impl<'a> Session<'a> {
         if input.get("__unparsed").is_some() {
             let msg = "The tool input was not valid JSON (the response may have hit max_tokens). Retry with a smaller call.";
             self.eng.record(&self.branch, "tool.post", json!({ "call": id, "tool": name, "summary": sum, "result": msg, "is_error": true }))?;
-            return Ok(());
+            return Ok(false);
         }
         // Dry world: known outside-world actions are blocked; commands we cannot classify run with no
         // network, so they can change the workspace but cannot reach anything outside it.
@@ -275,7 +309,7 @@ impl<'a> Session<'a> {
                 "tool.blocked",
                 json!({ "call": id, "tool": name, "summary": sum, "class": class, "result": msg, "is_error": true }),
             )?;
-            return Ok(());
+            return Ok(false);
         }
         let mut pre = json!({ "call": id, "tool": name, "summary": sum, "input": shrink(input), "class": class });
         if offline {
@@ -295,8 +329,117 @@ impl<'a> Session<'a> {
         } else {
             body["result"] = json!(out.text);
         }
-        self.eng.record(&self.branch, "tool.post", body)?;
-        Ok(())
+        let post = self.eng.record(&self.branch, "tool.post", body)?;
+        Ok(!crate::engine::changes(&post).is_empty())
+    }
+
+    /// Check the current world and record the result. Returns true when it triggered a rollback.
+    pub fn run_check(&mut self) -> Result<bool> {
+        let Some(cfg) = self.checks.clone() else { return Ok(false) };
+        let chain = self.chain()?;
+        let tree = self.eng.world.snapshot()?;
+        let res = crate::checks::run(self.eng, &tree, &cfg.cmd, cfg.timeout)?;
+        let prev = chain.iter().rev().find(|e| e.kind == "check");
+        let prev_value = prev.and_then(|p| p.body["score"]["value"].as_f64());
+        let prev_green = prev.and_then(|p| p.body["score"]["green"].as_bool());
+        let sc = &res.score;
+        let counts = if sc.passed + sc.failed > 0 { format!("{} passed, {} failed", sc.passed, sc.failed) } else { format!("exit {}", res.exit) };
+        let note = if !sc.green {
+            let last: Vec<&str> = res.tail.lines().collect();
+            let last = last[last.len().saturating_sub(15)..].join("\n");
+            Some(format!("[harness event, not from the user] Automatic check `{}` on the current files: failing ({counts}). Last lines:\n{last}", cfg.cmd))
+        } else if prev_green == Some(false) {
+            Some(format!("[harness event, not from the user] Automatic check `{}` passes again ({counts}).", cfg.cmd))
+        } else if prev_value.is_some_and(|v| sc.value < v) {
+            Some(format!("[harness event, not from the user] Automatic check `{}` passes, but the score dropped from {} to {} ({counts}).", cfg.cmd, prev_value.unwrap_or(0.0), sc.value))
+        } else {
+            None
+        };
+        let mut body = json!({
+            "cmd": cfg.cmd, "exit": res.exit, "score": sc, "cached": res.cached,
+            "duration_ms": res.duration_ms, "output": res.tail,
+        });
+        if let Some(n) = &note {
+            body["note"] = json!(n);
+        }
+        self.eng.record_tree(&self.branch, "check", &tree, body)?;
+        self.ui.check(&res);
+        if cfg.rollback_after > 0 {
+            return self.maybe_rollback(cfg.rollback_after);
+        }
+        Ok(false)
+    }
+
+    /// Restore the best checked state when the last `n` checks were all worse than it.
+    fn maybe_rollback(&mut self, n: usize) -> Result<bool> {
+        let chain = self.chain()?;
+        let scores: Vec<(usize, f64)> = chain
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.kind == "check")
+            .map(|(i, e)| (i, e.body["score"]["value"].as_f64().unwrap_or(0.0)))
+            .collect();
+        // Best = highest value; on ties the latest, which keeps the most progress.
+        let Some(&(best_idx, best)) = scores.iter().fold(None, |acc: Option<&(usize, f64)>, x| match acc {
+            Some(a) if a.1 > x.1 => Some(a),
+            _ => Some(x),
+        }) else {
+            return Ok(false);
+        };
+        let streak = scores.iter().rev().take_while(|&&(_, v)| v < best).count();
+        if streak < n {
+            return Ok(false);
+        }
+        let Some((_, task)) = current_task(&chain) else { return Ok(false) };
+        let done = self
+            .eng
+            .lineage(&self.branch)?
+            .iter()
+            .filter(|e| e.kind == "world.rewind" && e.str("task") == Some(&task) && e.body.get("auto").is_some())
+            .count();
+        if done >= MAX_ROLLBACKS {
+            return Ok(false);
+        }
+        let target = chain[best_idx].clone();
+        let plan = rewind::plan(self.eng, &self.branch, &target, Mode::KeepHuman)?;
+        if !plan.external.is_empty() {
+            self.ui.note("[rune] checks regressed, but rolling back would cross actions that reached the outside world; not rolling back.");
+            return Ok(false);
+        }
+        let is_task_start = |e: &Event| (e.kind == "turn.start" && e.id == task) || (e.kind == "world.rewind" && e.str("task") == Some(&task));
+        let has_prompt = chain[..=best_idx].iter().any(|e| is_task_start(e));
+        let prompt = if has_prompt { None } else { self.eng.store.get(&task)?.str("prompt").map(str::to_string) };
+        let attempts: Vec<String> = plan
+            .dropped
+            .iter()
+            .filter(|d| d.author == "agent")
+            .map(|d| format!("{} [{}]", d.label, d.changed.join(", ")))
+            .take(10)
+            .collect();
+        let best_desc = {
+            let s = &target.body["score"];
+            match (s["passed"].as_u64(), s["failed"].as_u64()) {
+                (Some(p), Some(f)) if p + f > 0 => format!("{p} passed, {f} failed"),
+                _ => format!("score {best}"),
+            }
+        };
+        let rest = rewind::note(&plan, None, prompt.as_deref());
+        let rest = rest.trim_start_matches("[harness event, not from the user] ");
+        let note = format!(
+            "[harness event, not from the user] Automatic checks got worse {streak} times in a row after the best result so far ({best_desc}). {rest}\nUndone attempts:\n- {}\nTry a different approach instead of repeating them.",
+            if attempts.is_empty() { "(none recorded)".to_string() } else { attempts.join("\n- ") }
+        );
+        let cur_turn = chain.last().and_then(Event::turn).unwrap_or(0);
+        let t_turn = target.turn().unwrap_or(0);
+        let turn = if t_turn < cur_turn { t_turn + 1 } else { cur_turn };
+        rewind::apply_with(
+            self.eng,
+            &plan,
+            false,
+            json!({ "note": note, "task": task, "turn": turn, "auto": true, "streak": streak, "best": target.id }),
+        )?;
+        self.ui.note(&note);
+        Ok(true)
     }
 
     /// Returns None when the rewind happened, or Some(reason) when it was rejected.

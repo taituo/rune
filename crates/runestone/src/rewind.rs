@@ -56,6 +56,7 @@ pub struct Plan {
     pub branch: String,
     pub mode: Mode,
     pub target: String,
+    pub target_kind: String,
     pub target_turn: u64,
     pub live_tree: String,
     pub result_tree: String,
@@ -165,6 +166,7 @@ pub fn plan(eng: &Engine, branch: &str, target: &Event, mode: Mode) -> Result<Pl
         branch: branch.into(),
         mode,
         target: target.id.clone(),
+        target_kind: target.kind.clone(),
         target_turn: target.turn().unwrap_or(0),
         live_tree: live,
         result_tree: cur,
@@ -219,7 +221,8 @@ pub fn note(plan: &Plan, lesson: Option<(&str, &str)>, prompt: Option<&str>) -> 
     let mut s = String::from("[harness event, not from the user] ");
     match lesson {
         Some(_) => s += &format!("You rewound yourself to an earlier point (turn {}). Everything after it is forgotten, and the files were restored to match, keeping changes made by others.", plan.target_turn),
-        None => s += &format!("The conversation and the world were restored to the end of turn {}. Changes made by others were kept.", plan.target_turn),
+        None if plan.target_kind == "turn.end" => s += &format!("The conversation and the world were restored to the end of turn {}. Changes made by others were kept.", plan.target_turn),
+        None => s += &format!("The conversation and the world were restored to an earlier point (turn {}). Changes made by others were kept.", plan.target_turn),
     }
     let kept: std::collections::BTreeSet<&String> = plan.kept.iter().flat_map(|k| &k.changed).collect();
     if !kept.is_empty() {

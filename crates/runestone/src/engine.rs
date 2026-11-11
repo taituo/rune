@@ -59,6 +59,14 @@ impl Engine {
     }
 
     pub fn record_tree(&self, branch: &str, kind: &str, tree: &str, extra: Value) -> Result<Event> {
+        let ev = self.append_tree(branch, kind, tree, extra)?;
+        if !changes(&ev).is_empty() || ev.parents.is_empty() {
+            self.world.pin(tree)?;
+        }
+        Ok(ev)
+    }
+
+    fn append_tree(&self, branch: &str, kind: &str, tree: &str, extra: Value) -> Result<Event> {
         self.store.append(branch, kind, |head| {
             let prev_tree = head.and_then(Event::tree).unwrap_or(EMPTY_TREE);
             let changed = self.world.diff(prev_tree, tree)?;

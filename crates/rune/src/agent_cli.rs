@@ -93,6 +93,17 @@ impl Ui for StdUi {
         self.tokens_cached += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
         self.tokens_out += u["output_tokens"].as_u64().unwrap_or(0);
     }
+    fn check(&mut self, r: &runestone::checks::CheckResult) {
+        self.newline();
+        let sc = &r.score;
+        let counts = if sc.passed + sc.failed > 0 { format!("{} passed, {} failed", sc.passed, sc.failed) } else { format!("exit {}", r.exit) };
+        let how = if r.cached { "cached".to_string() } else { format!("{:.1}s", r.duration_ms as f64 / 1000.0) };
+        if sc.green {
+            println!("{DIM}✓ check {counts} ({how}){OFF}");
+        } else {
+            println!("{RED}✗ check {counts} ({how}){OFF}");
+        }
+    }
     fn ask(&mut self, q: &str) -> bool {
         self.newline();
         print!("{YELLOW}{q} [y/N] {OFF}");
@@ -110,6 +121,10 @@ pub struct Opts {
     pub show_thinking: bool,
     pub resume: bool,
     pub max_steps: usize,
+    /// Check command (None: detect; Some("") disables)
+    pub check: Option<String>,
+    pub check_every: usize,
+    pub rollback_after: usize,
 }
 
 /// Pick or create the branch: an explicit name, the latest one (--resume), or a fresh session.
@@ -139,6 +154,21 @@ fn open_session<'a>(eng: &'a Engine, branch: Option<&str>, o: &Opts) -> Result<S
         ui: Box::new(StdUi::default()),
         perm: o.mode,
         max_steps: o.max_steps,
+        checks: checks_for(eng, o),
+    })
+}
+
+fn checks_for(eng: &Engine, o: &Opts) -> Option<agent::session::Checks> {
+    let cmd = match &o.check {
+        Some(c) if c.is_empty() => return None,
+        Some(c) => c.clone(),
+        None => runestone::checks::detect(&eng.world.worktree)?,
+    };
+    Some(agent::session::Checks {
+        cmd,
+        every: o.check_every,
+        rollback_after: o.rollback_after,
+        timeout: std::time::Duration::from_secs(600),
     })
 }
 
@@ -153,9 +183,10 @@ pub fn run_once(eng: &Engine, branch: Option<&str>, o: &Opts, prompt: &str) -> R
 pub fn chat(eng: &Engine, branch: Option<&str>, o: &Opts) -> Result<()> {
     let mut s = open_session(eng, branch, o)?;
     eprintln!(
-        "{DIM}rune · {} · {} · /help for commands{OFF}",
+        "{DIM}rune · {} · {} · checks: {} · /help for commands{OFF}",
         short_branch(&s.branch),
-        eng.world.worktree.display()
+        eng.world.worktree.display(),
+        s.checks.as_ref().map(|c| c.cmd.as_str()).unwrap_or("off")
     );
     let stdin = std::io::stdin();
     loop {
@@ -205,7 +236,7 @@ fn slash(s: &mut Session, cmd: &str) -> Result<bool> {
     match parts.first().copied().unwrap_or("") {
         "exit" | "quit" | "q" => return Ok(true),
         "help" => println!(
-            "/log [n]            recent events\n/rewind N [hard]    restore conversation and files to the end of turn N\n/undo               undo the last rewind\n/fork N DIR         copy the world at turn N into DIR as a new branch\n/continue           resume the loop from the current head\n/verify             re-render every request from the record and compare\n/exit"
+            "/log [n]            recent events\n/rewind N [hard]    restore conversation and files to the end of turn N\n/rewind green       restore to the last passing check\n/check              run the check now\n/undo               undo the last rewind\n/fork N DIR         copy the world at turn N into DIR as a new branch\n/continue           resume the loop from the current head\n/verify             re-render every request from the record and compare\n/exit"
         ),
         "log" => {
             let n: usize = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(15);
@@ -213,17 +244,28 @@ fn slash(s: &mut Session, cmd: &str) -> Result<bool> {
                 println!("  {}", ops::describe(ev));
             }
         }
+        "check" => {
+            if s.checks.is_none() {
+                println!("no check command (start with --check CMD)");
+            } else {
+                s.run_check()?;
+            }
+        }
         "rewind" => {
-            let n: u64 = parts.get(1).and_then(|x| x.parse().ok()).context("usage: /rewind N [hard]")?;
             let mode = if parts.get(2) == Some(&"hard") { Mode::Hard } else { Mode::KeepHuman };
             let chain = s.chain()?;
-            let target = chain
-                .iter()
-                .rev()
-                .find(|e| e.turn() == Some(n) && e.kind == "turn.end")
-                .or_else(|| chain.iter().rev().find(|e| e.turn() == Some(n)))
-                .cloned()
-                .with_context(|| format!("no turn {n} in this conversation"))?;
+            let target = if parts.get(1) == Some(&"green") {
+                last_green(&chain).context("no passing check in this conversation")?
+            } else {
+                let n: u64 = parts.get(1).and_then(|x| x.parse().ok()).context("usage: /rewind N|green [hard]")?;
+                chain
+                    .iter()
+                    .rev()
+                    .find(|e| e.turn() == Some(n) && e.kind == "turn.end")
+                    .or_else(|| chain.iter().rev().find(|e| e.turn() == Some(n)))
+                    .cloned()
+                    .with_context(|| format!("no turn {n} in this conversation"))?
+            };
             let plan = rewind::plan(eng, &s.branch, &target, mode)?;
             print!("{}", plan.render());
             if !s.ui.ask("Apply this rewind?") {
@@ -257,6 +299,11 @@ fn slash(s: &mut Session, cmd: &str) -> Result<bool> {
         other => println!("unknown command /{other}; /help"),
     }
     Ok(false)
+}
+
+/// The latest passing check on a chain.
+pub fn last_green(chain: &[runestone::Event]) -> Option<runestone::Event> {
+    chain.iter().rev().find(|e| e.kind == "check" && e.body["score"]["green"].as_bool() == Some(true)).cloned()
 }
 
 /// Print the conversation exactly as the model would see it next.

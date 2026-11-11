@@ -15,7 +15,12 @@ rune transcript                   # the conversation exactly as the model will s
 rune verify                       # re-render every sent request from the record, compare bytes
 ```
 
-In chat: `/rewind N [hard]`, `/undo`, `/fork N DIR`, `/log`, `/continue`, `/verify`.
+In chat: `/rewind N|green [hard]`, `/undo`, `/fork N DIR`, `/check`, `/log`, `/continue`, `/verify`.
+
+Checks: `--check CMD` (default: detected from Cargo.toml, go.mod, package.json, pytest, Makefile),
+`--check-every N` (also mid-turn after N file-changing calls), `--rollback-after N` (restore the best
+checked state after N consecutive worse results). `rune check` runs it by hand; `rune rewind --green`
+targets the last passing check.
 
 | Piece | How |
 |---|---|
@@ -26,6 +31,8 @@ In chat: `/rewind N [hard]`, `/undo`, `/fork N DIR`, `/log`, `/continue`, `/veri
 | Self-rewind | `Rewind{point, lesson ≤300 chars, evidence}` restores conversation and files (keep-human) to the start of the current request or before a given call, then continues with only the lesson (plus the request, repeated). Max 3 per request; never past an outside-world action without a human. |
 | Dry world | `--mode dry`: known outside-world actions (push, deploy, HTTP writes, MCP writes) are blocked; commands rune cannot classify run in an unprivileged user+network namespace, so they change the workspace but cannot reach outside. `--mode ask` asks; `--mode auto` runs everything. |
 | Bash | Own process group, output to a file (background children don't block), timeout kills the group, head+tail clipping. |
+| Checks | At stable points (turn end, optionally every N changing calls) the recorded world is built and tested in a long-lived per-worktree workspace moved by changed files only, so build caches stay warm; offline when possible. Results keyed by (tree, cmd): a world is never checked twice. Scores parsed from cargo, pytest, jest and go output, or `rune-score: N`. Failures and recoveries reach the model as harness notes. |
+| Auto-rollback | After N consecutive checks worse than the best, a keep-human rewind to the best checked state, with the undone attempts listed for the model. At most 3 per request; never past an outside-world action. Abandoned branches stay in the record, and every recorded tree is pinned with a ref so git gc cannot collect them. |
 | Model | Anthropic Messages API, SSE streaming accumulated into the non-streaming shape, retries on 429/5xx/529 and stream errors. `--model`, `--effort`, `--show-thinking`. |
 
 ## Versioned world

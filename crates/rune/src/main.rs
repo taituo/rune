@@ -58,6 +58,15 @@ struct AgentArgs {
     resume: bool,
     #[arg(long, default_value_t = 400)]
     max_steps: usize,
+    /// Check command run at stable points (default: detected from the project; "" disables)
+    #[arg(long)]
+    check: Option<String>,
+    /// Also check mid-turn after this many file-changing tool calls (0: only at turn end)
+    #[arg(long, default_value_t = 0)]
+    check_every: usize,
+    /// Restore the best checked state after this many consecutive worse checks (0: never)
+    #[arg(long, default_value_t = 0)]
+    rollback_after: usize,
 }
 
 #[derive(Subcommand)]
@@ -111,6 +120,9 @@ enum Cmd {
         /// Undo the last rewind on the branch
         #[arg(long)]
         undo: bool,
+        /// Rewind to the last passing check
+        #[arg(long, conflicts_with_all = ["turn", "to", "undo"])]
+        green: bool,
         #[arg(long, value_enum, default_value = "keep-human")]
         mode: ModeArg,
         #[arg(long)]
@@ -148,6 +160,12 @@ enum Cmd {
     Bench {
         #[arg(short, default_value_t = 10)]
         n: usize,
+    },
+    /// Run the project's check (build + tests) on the current world and record the result
+    Check {
+        /// Command (default: detected from the project)
+        #[arg(long)]
+        cmd: Option<String>,
     },
     /// Verify every event id on a branch against its content
     Verify,
@@ -214,6 +232,9 @@ fn run(cli: Cli) -> Result<()> {
         show_thinking: a.show_thinking,
         resume: a.resume,
         max_steps: a.max_steps,
+        check: a.check.clone(),
+        check_every: a.check_every,
+        rollback_after: a.rollback_after,
     };
     match &cli.cmd {
         Cmd::Chat { a } => return agent_cli::chat(&eng, cli.branch.as_deref(), &opts(a, PermArg::Ask)),
@@ -292,13 +313,19 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Cmd::Rewind { turn, to, undo, mode, apply, accept_external } => {
+        Cmd::Rewind { turn, to, undo, green, mode, apply, accept_external } => {
             if undo {
                 let ev = rewind::undo(&eng, &branch)?;
                 println!("undone: {}", ops::describe(&ev));
                 return Ok(());
             }
-            let target = resolve(&eng, &branch, to.as_deref(), turn)?;
+            let target = if green {
+                let head = eng.store.head(&branch)?.context("no such branch")?;
+                let chain = runestone::agent::fold::effective_chain(&eng.store, &head)?;
+                agent_cli::last_green(&chain).context("no passing check on this branch")?
+            } else {
+                resolve(&eng, &branch, to.as_deref(), turn)?
+            };
             let mode = match mode {
                 ModeArg::KeepHuman => Mode::KeepHuman,
                 ModeArg::Hard => Mode::Hard,
@@ -350,6 +377,13 @@ fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Transcript => agent_cli::transcript(&eng, &branch, cli.json)?,
+        Cmd::Check { cmd } => {
+            let cmd = cmd.or_else(|| runestone::checks::detect(&eng.world.worktree)).context("no check command detected; pass --cmd")?;
+            let tree = eng.world.snapshot()?;
+            let r = runestone::checks::run(&eng, &tree, &cmd, std::time::Duration::from_secs(600))?;
+            let ev = eng.record_tree(&branch, "check", &tree, json!({ "cmd": cmd, "exit": r.exit, "score": r.score, "cached": r.cached, "duration_ms": r.duration_ms, "output": r.tail }))?;
+            println!("{} {} (passed {}, failed {}, {}){}", if r.score.green { "✓" } else { "✗" }, cmd, r.score.passed, r.score.failed, if r.cached { "cached".into() } else { format!("{} ms", r.duration_ms) }, format!("  [{}]", ev.short()));
+        }
         Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Chat { .. } | Cmd::Run { .. } => unreachable!(),
     }
     Ok(())

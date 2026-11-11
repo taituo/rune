@@ -232,6 +232,34 @@ impl World {
         Ok(live)
     }
 
+    /// Keep `tree` reachable for git's gc. Events reference trees only from the database, so without a ref
+    /// an abandoned branch's files could be collected.
+    pub fn pin(&self, tree: &str) -> Result<()> {
+        if tree == EMPTY_TREE {
+            return Ok(());
+        }
+        let r = format!("refs/rune/t/{tree}");
+        if self.git_dir.join(&r).exists() {
+            return Ok(());
+        }
+        self.git(&["update-ref", &r, tree])?;
+        Ok(())
+    }
+
+    /// Move a long-lived directory (the check workspace) to `tree`, rewriting only what changed. Ignored
+    /// paths (`target/`, `node_modules/` …) are left alone, so build caches stay warm between checks.
+    pub fn checkout_into(&self, dir: &Path, tree: &str) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let index = self.git_dir.join("check-index");
+        if index.exists() {
+            self.git_idx(&index, dir, &["read-tree", "--reset", "-u", tree])?;
+        } else {
+            self.git_idx(&index, dir, &["read-tree", tree])?;
+            self.git_idx(&index, dir, &["checkout-index", "-a", "-f"])?;
+        }
+        Ok(())
+    }
+
     /// Write `tree` into a fresh directory (a fork's world).
     pub fn materialize(&self, tree: &str, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;

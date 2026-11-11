@@ -27,7 +27,7 @@ fn session<'a>(eng: &'a Engine, script: &Rc<Scripted>, perm: Permission) -> Sess
     if eng.store.head(&b).unwrap().is_none() {
         Session::spawn(eng, &b, &Config::default(), "2026-11-11").unwrap();
     }
-    Session { eng, branch: b, provider: Box::new(Shared(script.clone())), ui: Box::new(Quiet), perm, max_steps: 50 }
+    Session { eng, branch: b, provider: Box::new(Shared(script.clone())), ui: Box::new(Quiet), perm, max_steps: 50, checks: None }
 }
 
 fn request(script: &Scripted, i: usize) -> Value {

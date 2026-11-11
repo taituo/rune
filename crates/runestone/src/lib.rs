@@ -5,6 +5,7 @@
 //! (`agent`) is built on the record: the conversation is a fold over the same events.
 
 pub mod agent;
+pub mod checks;
 pub mod classify;
 pub mod engine;
 pub mod hook;
