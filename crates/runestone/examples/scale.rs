@@ -35,7 +35,7 @@ fn main() -> anyhow::Result<()> {
     let mut s = Session { eng: &eng, branch: branch.clone(), provider: Box::new(Scripted::new(vec![])), ui: Box::new(Quiet), perm: Permission::Auto, max_steps: 1, checks: None };
     eng.record(&branch, "turn.start", json!({ "prompt": "scale test" }))?;
     let mut last = Instant::now();
-    println!("{:>6} {:>10} {:>12} {:>12} {:>10}", "step", "events", "step ms", "fold+render", "req KB");
+    println!("{:>6} {:>10} {:>12} {:>12} {:>10}", "step", "events", "step ms", "full refold", "req KB");
     for (i, resp) in script.into_iter().enumerate().take(steps) {
         s.provider = Box::new(Scripted::new(vec![resp]));
         let _ = s.run_loop();

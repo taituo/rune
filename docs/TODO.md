@@ -52,7 +52,8 @@ design notes doc ("rune: design notes, deep pass").
 - [ ] Same for the scan world (`git add -A` + `write-tree` still spawn per event), e.g. stat-cache + own index.
 - [ ] Base materialization dominates search start (0.6–5 s for 20k files, I/O-bound and noisy): reuse bases
       across searches, or populate lazily.
-- [ ] Incremental fold: cache messages per head, fold only new events (today O(events) per step).
+- [x] Incremental fold: per-branch cache, only new events folded; full refold on rewind. 16 ms/step at
+      1000 steps (was 124 ms), 24 ms at 2000; `rune verify` checks it against a full fold.
 - [ ] Interactive sessions on overlay too (agent layer + merge at turn end), not only search forks.
 - [ ] Warm build caches for search forks (shared, read-only `target/` or sccache).
 

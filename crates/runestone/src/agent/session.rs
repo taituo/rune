@@ -118,15 +118,70 @@ pub fn api_of(store: &Store, branch: &str) -> Result<String> {
     Ok(spawn_config(&chain).and_then(|s| s.body["config"]["api"].as_str().map(String::from)).unwrap_or_else(|| "anthropic".into()))
 }
 
-/// Render the exact request for the conversation at the end of `chain`.
+/// Render the exact request for the conversation at the end of `chain` (a full fold; the reference that
+/// `verify_requests` checks the incremental path against).
 pub fn render(store: &Store, chain: &[Event]) -> Result<Vec<u8>> {
     let spawn = spawn_config(chain).context("this branch has no rune session; start one with `rune chat`")?;
+    let folded = fold(store, chain)?;
+    render_messages(store, spawn, &folded.messages)
+}
+
+impl Engine {
+    /// Render the next request for `branch` from the cached fold, folding only events added since the
+    /// last call. A rewind on the way (or a cold cache) falls back to a full fold. Returns the request
+    /// bytes and the read-before-write pins.
+    pub fn render_head(&self, branch: &str) -> Result<(Vec<u8>, std::collections::HashMap<String, String>)> {
+        use super::fold::Folder;
+        let head = self.store.head(branch)?.with_context(|| format!("no branch {branch}"))?;
+        let mut cache = self.fold_cache.borrow_mut();
+        let mut fresh = None;
+        if let Some(f) = cache.get_mut(branch) {
+            if f.last.as_deref() != Some(head.as_str()) {
+                let mut new = Vec::new();
+                let mut cur = Some(head.clone());
+                let mut reached = false;
+                while let Some(id) = cur {
+                    if f.last.as_deref() == Some(id.as_str()) {
+                        reached = true;
+                        break;
+                    }
+                    let ev = self.store.get(&id)?;
+                    if ev.kind == "world.rewind" || new.len() > 10_000 {
+                        break; // the effective chain jumps here: refold from scratch
+                    }
+                    cur = ev.parents.first().cloned();
+                    new.push(ev);
+                }
+                if reached {
+                    for ev in new.iter().rev() {
+                        f.push(&self.store, ev)?;
+                    }
+                } else {
+                    fresh = Some(());
+                }
+            }
+        } else {
+            fresh = Some(());
+        }
+        if fresh.is_some() {
+            let mut f = Folder::default();
+            for ev in effective_chain(&self.store, &head)? {
+                f.push(&self.store, &ev)?;
+            }
+            cache.insert(branch.to_string(), f);
+        }
+        let f = cache.get(branch).expect("cached fold");
+        let spawn = f.spawn.as_ref().context("this branch has no rune session; start one with `rune chat`")?;
+        Ok((render_messages(&self.store, spawn, f.messages())?, f.seen().clone()))
+    }
+}
+
+fn render_messages(store: &Store, spawn: &Event, messages: &[Value]) -> Result<Vec<u8>> {
     let cfg = &spawn.body["config"];
     let system = String::from_utf8(store.blob(spawn.str("system").unwrap_or_default())?)?;
     let tools: Value = serde_json::from_slice(&store.blob(spawn.str("tools").unwrap_or_default())?)?;
-    let folded = fold(store, chain)?;
     if cfg["api"].as_str() == Some("openai") {
-        return Ok(serde_json::to_vec(&super::openai::render(cfg, &system, &tools, &folded.messages))?);
+        return Ok(serde_json::to_vec(&super::openai::render(cfg, &system, &tools, messages))?);
     }
     let mut body = json!({
         "model": cfg["model"],
@@ -134,7 +189,7 @@ pub fn render(store: &Store, chain: &[Event]) -> Result<Vec<u8>> {
         "stream": true,
         "system": [{ "type": "text", "text": system }],
         "tools": tools,
-        "messages": folded.messages,
+        "messages": messages,
         "cache_control": { "type": "ephemeral" },
     });
     if let Some(d) = cfg["thinking_display"].as_str() {
@@ -215,9 +270,7 @@ impl<'a> Session<'a> {
         let mut dirty = false; // files changed since the last check
         let mut usage = Usage::default();
         for step in 1..=self.max_steps {
-            let chain = self.chain()?;
-            let folded = fold(&self.eng.store, &chain)?;
-            let req = render(&self.eng.store, &chain)?;
+            let (req, seen) = self.eng.render_head(&self.branch)?;
             let req_hash = self.eng.store.put_blob(&req)?;
             let ui = &mut self.ui;
             let resp = self.provider.send(&req, &mut |d| match d {
@@ -268,7 +321,7 @@ impl<'a> Session<'a> {
                 }
                 return Ok(TurnResult { text, steps: step, stop, usage });
             }
-            let mut ctx = tools::Ctx { worktree: self.eng.world.worktree.clone(), tmp: tmp.clone(), seen: folded.seen, offline: false, alias: self.eng.world.alias.clone() };
+            let mut ctx = tools::Ctx { worktree: self.eng.world.worktree.clone(), tmp: tmp.clone(), seen, offline: false, alias: self.eng.world.alias.clone() };
             for tu in uses {
                 let (id, name, input) = (tu["id"].as_str().unwrap_or(""), tu["name"].as_str().unwrap_or(""), &tu["input"]);
                 if name == "Rewind" {

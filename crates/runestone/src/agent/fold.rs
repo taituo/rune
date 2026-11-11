@@ -53,10 +53,31 @@ pub struct Folded {
 }
 
 pub fn fold(store: &Store, chain: &[Event]) -> Result<Folded> {
-    let mut m = Msgs::default();
-    let mut seen = HashMap::new();
+    let mut f = Folder::default();
     for ev in chain {
+        f.push(store, ev)?;
+    }
+    Ok(f.folded())
+}
+
+/// Incremental fold state: push events in chain order. Used directly by the per-branch cache, so a step
+/// folds only the events added since the last one.
+#[derive(Default, Clone)]
+pub struct Folder {
+    m: Msgs,
+    seen: HashMap<String, String>,
+    /// The latest spawn event that carries a session config.
+    pub spawn: Option<Event>,
+    /// The last event folded (the head this state corresponds to).
+    pub last: Option<String>,
+}
+
+impl Folder {
+    pub fn push(&mut self, store: &Store, ev: &Event) -> Result<()> {
+        let (m, seen) = (&mut self.m, &mut self.seen);
+        self.last = Some(ev.id.clone());
         match ev.kind.as_str() {
+            "spawn" if ev.body.get("system").is_some() => self.spawn = Some(ev.clone()),
             "turn.start" => {
                 let mut blocks = Vec::new();
                 if let Some(n) = ev.str("note") {
@@ -88,7 +109,7 @@ pub fn fold(store: &Store, chain: &[Event]) -> Result<Folded> {
             }
             "tool.post" | "tool.blocked" => {
                 let (Some(call), true) = (ev.str("call"), ev.body.get("result").is_some() || ev.body.get("result_blob").is_some()) else {
-                    continue;
+                    return Ok(());
                 };
                 let is_error = ev.body.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                 m.tool_result(call, &result_text(store, ev)?, is_error);
@@ -102,11 +123,23 @@ pub fn fold(store: &Store, chain: &[Event]) -> Result<Folded> {
             }
             _ => {}
         }
+        Ok(())
     }
-    Ok(Folded { messages: m.done(), seen })
+
+    pub fn messages(&self) -> &[Value] {
+        &self.m.v
+    }
+
+    pub fn seen(&self) -> &HashMap<String, String> {
+        &self.seen
+    }
+
+    pub fn folded(&self) -> Folded {
+        Folded { messages: self.m.v.clone(), seen: self.seen.clone() }
+    }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Msgs {
     v: Vec<Value>,
 }
@@ -166,9 +199,6 @@ impl Msgs {
         self.push_user_blocks(vec![b]);
     }
 
-    fn done(self) -> Vec<Value> {
-        self.v
-    }
 }
 
 /// The current task: the latest user request, or the request a self-rewind is still working on.
