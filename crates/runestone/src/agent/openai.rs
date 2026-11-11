@@ -189,13 +189,18 @@ fn stop_reason(finish: &str) -> &'static str {
     }
 }
 
+/// Gateways differ: chat/completions names (prompt_tokens, prompt_tokens_details) or Responses-API names
+/// (input_tokens, input_tokens_details). Read both.
 fn usage(u: &Value) -> Value {
-    let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
-    let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+    let prompt = u["prompt_tokens"].as_u64().or_else(|| u["input_tokens"].as_u64()).unwrap_or(0);
+    let cached = u["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .or_else(|| u["input_tokens_details"]["cached_tokens"].as_u64())
+        .unwrap_or(0);
     json!({
         "input_tokens": prompt.saturating_sub(cached),
         "cache_read_input_tokens": cached,
-        "output_tokens": u["completion_tokens"].as_u64().unwrap_or(0),
+        "output_tokens": u["completion_tokens"].as_u64().or_else(|| u["output_tokens"].as_u64()).unwrap_or(0),
     })
 }
 

@@ -128,6 +128,17 @@ fn handles_a_server_that_does_not_stream() {
 }
 
 #[test]
+fn reads_cached_tokens_under_either_name() {
+    let (port, h) = serve(vec![sse(&[
+        json!({ "id": "c", "choices": [{ "index": 0, "delta": { "content": "hi" }, "finish_reason": "stop" }] }),
+        json!({ "id": "c", "choices": [], "usage": { "prompt_tokens": 50, "completion_tokens": 3, "input_tokens_details": { "cached_tokens": 40 } } }),
+    ])]);
+    let m = OpenAi::new(&format!("http://127.0.0.1:{port}"), None, false).send(b"{}", &mut |_| {}).unwrap();
+    h.join().unwrap();
+    assert_eq!(m["usage"], json!({ "input_tokens": 10, "cache_read_input_tokens": 40, "output_tokens": 3 }));
+}
+
+#[test]
 fn lists_models() {
     let (port, h) = serve(vec![json_resp(&json!({ "data": [{ "id": "qwen3-coder" }, { "id": "gpt-oss-120b" }] }))]);
     let ids = openai::list_models(&format!("http://127.0.0.1:{port}"), None).unwrap();

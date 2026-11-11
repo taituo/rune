@@ -13,7 +13,9 @@ fn in_ns(name: &str) -> bool {
     }
     let ok = Command::new("unshare").args(["--user", "--map-root-user", "--mount", "true"]).status().map(|s| s.success()).unwrap_or(false);
     if !ok {
-        eprintln!("skipping {name}: no unprivileged user namespaces");
+        // Visible only with --nocapture; RUNE_REQUIRE_NS=1 turns the skip into a failure.
+        assert!(std::env::var("RUNE_REQUIRE_NS").is_err(), "{name}: no unprivileged user namespaces (RUNE_REQUIRE_NS=1)");
+        eprintln!("SKIPPED {name}: no unprivileged user namespaces");
         return false;
     }
     let exe = std::env::current_exe().unwrap();

@@ -193,7 +193,8 @@ fn dry_world_blocks_external_actions() {
 #[test]
 fn dry_world_runs_unknown_commands_offline() {
     if !runestone::agent::tools::offline_available() {
-        eprintln!("skipping: no unprivileged user namespaces here");
+        assert!(std::env::var("RUNE_REQUIRE_NS").is_err(), "no unprivileged user namespaces (RUNE_REQUIRE_NS=1)");
+        eprintln!("SKIPPED: no unprivileged user namespaces here");
         return;
     }
     let (_h, wt, eng) = setup();
