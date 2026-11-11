@@ -31,7 +31,7 @@ fn script(i: usize, steps: usize) -> Vec<Value> {
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if !in_namespace() {
+    if !in_namespace() && std::env::var("RUNE_COPY").is_err() {
         let st = std::process::Command::new("unshare")
             .args(["--user", "--map-root-user", "--mount"])
             .arg(std::env::current_exe()?)

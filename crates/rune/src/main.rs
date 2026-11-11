@@ -214,7 +214,15 @@ enum Cmd {
 fn main() {
     let cli = Cli::parse();
     // Overlay forks need an unprivileged user + mount namespace: re-run ourselves inside one.
-    if matches!(cli.cmd, Cmd::Search { .. }) && !runestone::layer::in_namespace() {
+    let ns_ok = || {
+        std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    };
+    if matches!(cli.cmd, Cmd::Search { .. }) && !runestone::layer::in_namespace() && ns_ok() {
         let exe = std::env::current_exe().expect("own path");
         let status = std::process::Command::new("unshare")
             .args(["--user", "--map-root-user", "--mount"])
@@ -371,6 +379,9 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
             println!("search {} from {} ({} attempts, base ready in {} ms, total {} ms)", r.id, &r.start[..12], r.outcomes.len(), r.base_ms, r.total_ms);
+            if r.isolation == "copy" {
+                println!("  forks were directory copies (no user namespaces): a shell command that reaches the main worktree through an indirect path is not contained");
+            }
             let sc = |s: &Option<runestone::checks::Score>| match s {
                 Some(s) => format!("{}{}/{}", if s.green { "✓" } else { "✗" }, s.passed, s.passed + s.failed),
                 None => "-".into(),

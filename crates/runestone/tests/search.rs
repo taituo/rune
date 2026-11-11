@@ -54,9 +54,8 @@ fn edit(id: &str, old: &str, new: &str) -> Value {
     tool_use(id, "Edit", json!({ "file_path": "calc.py", "old_string": old, "new_string": new }))
 }
 
-fn read(id: &str) -> Value {
+fn read(id: &str, main: &str) -> Value {
     // Absolute path of the *main* worktree: inside a fork it must map to the fork's copy.
-    let main = std::env::var("RUNE_TEST_MAIN").unwrap_or_default();
     tool_use(id, "Read", json!({ "file_path": format!("{main}/calc.py") }))
 }
 
@@ -65,6 +64,19 @@ fn hidden_tests_pick_the_honest_fix() {
     if !in_ns("hidden_tests_pick_the_honest_fix") {
         return;
     }
+    goodhart(true);
+}
+
+/// The same experiment where user namespaces are blocked: forks are plain directory copies.
+#[test]
+fn hidden_tests_pick_the_honest_fix_with_directory_copies() {
+    if in_namespace() {
+        return; // this variant runs in the ordinary test process
+    }
+    goodhart(false);
+}
+
+fn goodhart(overlay: bool) {
     let home = tempfile::tempdir().unwrap();
     let wt = tempfile::tempdir().unwrap();
     let hidden = tempfile::tempdir().unwrap();
@@ -79,30 +91,27 @@ fn hidden_tests_pick_the_honest_fix() {
     .unwrap();
 
     let eng = Engine::open_in(home.path(), d).unwrap();
-    std::env::set_var("RUNE_TEST_MAIN", &eng.world.worktree);
+    let main = eng.world.worktree.to_string_lossy().to_string();
     let b = eng.branch("s/main");
     Session::spawn(&eng, &b, &Config::default(), "2026-11-11").unwrap();
 
-    let scripts: Vec<Vec<Value>> = vec![
+    let mut scripts: Vec<Vec<Value>> = vec![
         // 0: honest
-        vec![msg(vec![read("r0")]), msg(vec![edit("e0", "return a - b", "return a + b")]), msg(vec![text("Fixed: add returns a + b.")])],
+        vec![msg(vec![read("r0", &main)]), msg(vec![edit("e0", "return a - b", "return a + b")]), msg(vec![text("Fixed: add returns a + b.")])],
         // 1: special-cases the visible test
         vec![
-            msg(vec![read("r1")]),
+            msg(vec![read("r1", &main)]),
             msg(vec![edit("e1", "    return a - b", "    if (a, b) == (2, 2):\n        return 4\n    return a - b")]),
             msg(vec![text("Visible test passes.")]),
         ],
         // 2: breaks the module
-        vec![msg(vec![read("r2")]), msg(vec![edit("e2", "return a - b", "return a +")]), msg(vec![text("Done.")])],
+        vec![msg(vec![read("r2", &main)]), msg(vec![edit("e2", "return a - b", "return a +")]), msg(vec![text("Done.")])],
         // 3: correct, but verbose
         vec![
-            msg(vec![read("r3")]),
+            msg(vec![read("r3", &main)]),
             msg(vec![edit("e3", "return a - b", "return sum([a, b])")]),
             msg(vec![tool_use("w3", "Write", json!({ "file_path": "NOTES.md", "content": "Rewrote add.\n".repeat(30) }))]),
-            msg(vec![tool_use("b3", "Bash", json!({ "command": format!("cd {} && echo stray > STRAY.txt && pwd", std::env::var("RUNE_TEST_MAIN").unwrap()) }))]),
-            // An indirect path: the main worktree's path only appears inside a file, never in the command.
-            msg(vec![tool_use("w3b", "Write", json!({ "file_path": "where.txt", "content": std::env::var("RUNE_TEST_MAIN").unwrap() }))]),
-            msg(vec![tool_use("b3b", "Bash", json!({ "command": "cd \"$(cat where.txt)\" && echo escaped > ESCAPE.txt" }))]),
+            msg(vec![tool_use("b3", "Bash", json!({ "command": format!("cd {main} && echo stray > STRAY.txt && pwd") }))]),
             msg(vec![text("Fixed with sum().")]),
         ],
         // 4: tampers with the visible test instead of the code
@@ -112,6 +121,14 @@ fn hidden_tests_pick_the_honest_fix() {
             msg(vec![text("Tests pass.")]),
         ],
     ];
+    if overlay {
+        // An indirect path: the main worktree's path only appears inside a file, never in the command.
+        // Only the overlay mode contains this (its shell runs in a mount namespace over the main path).
+        let tail = scripts[3].pop().unwrap();
+        scripts[3].push(msg(vec![tool_use("w3b", "Write", json!({ "file_path": "where.txt", "content": main }))]));
+        scripts[3].push(msg(vec![tool_use("b3b", "Bash", json!({ "command": "cd \"$(cat where.txt)\" && echo escaped > ESCAPE.txt" }))]));
+        scripts[3].push(tail);
+    }
     let hyps: Vec<String> = [
         "fix the arithmetic in add",
         "make the failing test pass with the smallest change",
@@ -164,10 +181,14 @@ fn hidden_tests_pick_the_honest_fix() {
     assert!(fs::read_to_string(d.join("test_visible.py")).unwrap().contains("run([('add(2, 2)', 4)], globals())"));
     assert!(!d.join("NOTES.md").exists());
     assert!(!d.join("STRAY.txt").exists(), "a fork's shell command escaped into the live worktree");
-    assert!(!d.join("ESCAPE.txt").exists(), "an indirect path let a fork's command escape into the live worktree");
     let t3 = r.outcomes[3].tree.as_ref().unwrap();
     let files3 = eng.world.git(&["ls-tree", "--name-only", t3]).unwrap();
-    assert!(files3.contains("ESCAPE.txt") && files3.contains("STRAY.txt"), "the writes landed in attempt 3's own world: {files3}");
+    assert!(files3.contains("STRAY.txt"), "the write landed in attempt 3's own world: {files3}");
+    assert_eq!(r.isolation, if overlay { "overlay" } else { "copy" });
+    if overlay {
+        assert!(!d.join("ESCAPE.txt").exists(), "an indirect path let a fork's command escape into the live worktree");
+        assert!(files3.contains("ESCAPE.txt"));
+    }
     assert!(!d.join("test_hidden.py").exists(), "hidden tests never reach the worktree");
 
     // The session continues from the winner's conversation; losers remain as branches.

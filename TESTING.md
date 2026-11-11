@@ -35,8 +35,12 @@ namespaces are blocked: usually Ubuntu's AppArmor setting, or running inside a c
 
 - steps 1–4 still work, but use `--mode ask` or `--mode auto`: without the offline sandbox, dry mode blocks every
   command rune cannot classify, including `python3 test_visible.py`;
-- step 5 (search) needs namespaces. On Ubuntu: `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`
-  (until reboot), or run in a VM.
+- step 5 (search) still works, with plain directory copies as forks instead of overlays. It prints a line saying
+  so. Copies cost more on big trees (about 0.6 s per attempt for 20k files), and a shell command that reaches the
+  main worktree through an indirect path (a path read from a file) is not contained. To get overlay forks on
+  Ubuntu: `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0` (until reboot).
+
+`RUNE_REQUIRE_NS=1 cargo test` fails instead of skipping where namespaces are missing.
 
 ## 1. Does it talk to the API at all? (2 min)
 

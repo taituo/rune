@@ -131,7 +131,7 @@ impl World {
         run(self.cmd(&self.index(), &self.worktree).args(args))
     }
 
-    fn git_idx(&self, index: &Path, work_tree: &Path, args: &[&str]) -> Result<String> {
+    pub(crate) fn git_idx(&self, index: &Path, work_tree: &Path, args: &[&str]) -> Result<String> {
         run(self.cmd(index, work_tree).args(args))
     }
 

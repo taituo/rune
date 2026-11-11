@@ -334,6 +334,28 @@ fn walk(dir: &Path, rel: &str, files: &mut Vec<(String, PathBuf, std::fs::Metada
 }
 
 impl Engine {
+    /// An engine over a plain directory copy of `base_tree` (for machines without user namespaces).
+    /// The copy is checked out with the same index the fork snapshots with, so its stat cache is fresh
+    /// and the first scan only stats files. Objects are shared with the parent.
+    pub fn open_copy(parent: &Engine, dir: &Path, base_tree: &str, key: &str) -> Result<Engine> {
+        std::fs::create_dir_all(dir)?;
+        let index = parent.world.git_dir.join(format!("index.copy.{key}"));
+        let _ = std::fs::remove_file(&index);
+        parent.world.git_idx(&index, dir, &["read-tree", base_tree])?;
+        parent.world.git_idx(&index, dir, &["checkout-index", "-a", "-f"])?;
+        let world = World {
+            worktree: std::fs::canonicalize(dir)?,
+            git_dir: parent.world.git_dir.clone(),
+            key: key.to_string(),
+            index_path: index,
+            layer: None,
+            hashes: Default::default(),
+            alias: Some(parent.world.worktree.clone()),
+            odb: crate::objects::Odb::new(&parent.world.git_dir),
+        };
+        Ok(Engine { store: Store::open(&parent.home.join("rune.db"))?, world, home: parent.home.clone() })
+    }
+
     /// An engine whose world is a mounted layer. Same database and object store as the parent.
     pub fn open_layered(parent: &Engine, layer: &Layer, key: &str) -> Result<Engine> {
         Ok(Engine {

@@ -64,14 +64,14 @@ pub struct SearchResult {
     pub merge_conflicts: Vec<String>,
     pub base_ms: u64,
     pub total_ms: u64,
+    /// "overlay": overlayfs forks, shell commands jailed in a mount namespace over the main path.
+    /// "copy": plain directory copies (no user namespaces); shell commands only get literal path mapping.
+    pub isolation: String,
 }
 
 pub type ProviderFactory<'a> = dyn Fn(usize) -> Box<dyn Provider> + Sync + 'a;
 
 pub fn run(eng: &Engine, branch: &str, spec: &Spec, providers: &ProviderFactory) -> Result<SearchResult> {
-    if !in_namespace() {
-        bail!("search needs a user + mount namespace for overlay forks (the rune CLI sets this up)");
-    }
     if spec.hypotheses.is_empty() {
         bail!("search needs at least one hypothesis");
     }
@@ -87,7 +87,7 @@ pub fn run(eng: &Engine, branch: &str, spec: &Spec, providers: &ProviderFactory)
         json!({ "search": sid, "prompt": spec.prompt, "hypotheses": spec.hypotheses, "visible": spec.visible }),
     )?;
     let base = start.tree().unwrap_or_default().to_string();
-    let base_dir = ensure_base(&eng.world, &eng.home, &base)?;
+    let base_dir = if in_namespace() { ensure_base(&eng.world, &eng.home, &base)? } else { PathBuf::new() };
     let base_ms = t0.elapsed().as_millis() as u64;
 
     let n = spec.hypotheses.len();
@@ -203,6 +203,7 @@ pub fn run(eng: &Engine, branch: &str, spec: &Spec, providers: &ProviderFactory)
         merge_conflicts: conflicts,
         base_ms,
         total_ms: t0.elapsed().as_millis() as u64,
+        isolation: if in_namespace() { "overlay".into() } else { "copy".into() },
     })
 }
 
@@ -224,12 +225,29 @@ fn attempt(
     let fork_branch = parent.branch(&format!("search/{sid}/{i}"));
     o.branch = fork_branch.clone();
     let key = format!("{sid}-{i}");
-    let layer = Layer::create(home, &key, base, vec![base_dir.to_path_buf()])?;
-    let tm = Instant::now();
-    layer.mount()?;
-    o.mount_ms = tm.elapsed().as_secs_f64() * 1000.0;
+    let overlay = in_namespace();
+    let copy_root = home.join("layers/forks").join(&key);
+    let layer = if overlay {
+        let l = Layer::create(home, &key, base, vec![base_dir.to_path_buf()])?;
+        let tm = Instant::now();
+        l.mount()?;
+        o.mount_ms = tm.elapsed().as_secs_f64() * 1000.0;
+        Some(l)
+    } else {
+        let _ = std::fs::remove_dir_all(&copy_root);
+        None
+    };
     let result = (|| -> Result<()> {
-        let feng = Engine::open_layered(&parent, &layer, &key)?;
+        let tm = Instant::now();
+        let feng = match &layer {
+            Some(l) => Engine::open_layered(&parent, l, &key)?,
+            None => {
+                let e = Engine::open_copy(&parent, &copy_root.join("tree"), base, &key)?;
+                o.mount_ms = tm.elapsed().as_secs_f64() * 1000.0; // time to copy the tree
+                e
+            }
+        };
+        let work = feng.world.worktree.clone();
         let start = feng.store.get(start_id)?;
         let fork = feng.store.put(
             vec![start_id.to_string()],
@@ -269,7 +287,7 @@ fn attempt(
         o.diff_lines = changes.iter().map(|c| c.added.unwrap_or(1) + c.deleted.unwrap_or(1)).sum();
         o.files = changes.iter().map(|c| format!("{} {}", c.status, c.path)).collect();
         if let Some(cmd) = &spec.visible {
-            let (exit, out, _) = exec(&layer.merged, cmd, spec.timeout)?;
+            let (exit, out, _) = exec(&work, cmd, spec.timeout)?;
             o.visible = Some(parse(&out, exit));
         }
         o.tree = Some(tree.clone());
@@ -282,22 +300,57 @@ fn attempt(
         let _ = std::fs::remove_file(&feng.world.index_path);
         Ok(())
     })();
-    layer.umount()?;
-    // Held-out evaluation: hidden files stacked over this attempt's layer, which is now read-only.
+    if let Some(l) = &layer {
+        l.umount()?;
+    }
+    // Held-out evaluation, on a read-only view of the attempt: the hidden files sit on top of it and the
+    // attempt never saw them.
     if result.is_ok() {
         if let Some(h) = &spec.hidden {
-            let ev = Layer::create(home, &format!("{key}-eval"), base, vec![h.dir.clone(), layer.upper.clone(), base_dir.to_path_buf()])?;
-            ev.mount()?;
-            let r = exec(&ev.merged, &h.cmd, spec.timeout);
-            ev.remove();
+            let r = match &layer {
+                Some(l) => {
+                    let ev = Layer::create(home, &format!("{key}-eval"), base, vec![h.dir.clone(), l.upper.clone(), base_dir.to_path_buf()])?;
+                    ev.mount()?;
+                    let r = exec(&ev.merged, &h.cmd, spec.timeout);
+                    ev.remove();
+                    r
+                }
+                None => {
+                    let ev = copy_root.join("eval");
+                    parent.world.materialize(o.tree.as_deref().unwrap_or(base), &ev)?;
+                    copy_tree(&h.dir, &ev)?;
+                    let r = exec(&ev, &h.cmd, spec.timeout);
+                    let _ = std::fs::remove_dir_all(&ev);
+                    r
+                }
+            };
             let (exit, out, _) = r?;
             o.hidden = Some(parse(&out, exit));
         }
     }
     if !spec.keep_dirs {
-        layer.remove();
+        match &layer {
+            Some(l) => l.remove(),
+            None => {
+                let _ = std::fs::remove_dir_all(&copy_root);
+            }
+        }
+        let _ = std::fs::remove_file(parent.world.git_dir.join(format!("index.copy.{key}")));
     }
     result
+}
+
+fn copy_tree(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    for e in std::fs::read_dir(src)?.flatten() {
+        let to = dst.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            std::fs::create_dir_all(&to)?;
+            copy_tree(&e.path(), &to)?;
+        } else {
+            std::fs::copy(e.path(), &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Best attempt: must pass the strongest check available (hidden, else visible); then by hidden score,

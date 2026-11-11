@@ -54,8 +54,9 @@ the agent, and each Bash command in a fork runs in its own mount namespace with 
 that path, so even indirect paths land in the fork; the winner's conversation stays valid after the fork
 directory is removed.
 
-Needs unprivileged user namespaces (`unshare`, overlayfs with `userxattr`); the CLI re-executes itself
-inside one. `--script DIR` runs scripted attempts (`attempt-<i>.json`) instead of a model.
+With unprivileged user namespaces (`unshare`, overlayfs with `userxattr`) the CLI re-executes itself inside
+one and forks are overlays. Without them, forks are plain directory copies: same selection and merge, but
+slower on big trees (≈0.6 s per attempt for 20k files) and shell commands only get literal path mapping. `--script DIR` runs scripted attempts (`attempt-<i>.json`) instead of a model.
 
 Measured (2-core VM, 20k-file tree, 10 steps per attempt): layered snapshots equal a full scan (tested,
 including deletions, replaced directories, ignored files, modes and symlinks); a fork mounts in 2–40 ms;
