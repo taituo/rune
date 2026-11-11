@@ -129,16 +129,7 @@ fn real_path(p: &Path, depth: u32) -> PathBuf {
 
 /// Can we run commands in an unprivileged user + network namespace on this machine?
 pub fn offline_available() -> bool {
-    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OK.get_or_init(|| {
-        Command::new("unshare")
-            .args(["--user", "--map-root-user", "--net", "true"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    })
+    crate::sandbox::available()
 }
 
 pub struct Outcome {
@@ -371,7 +362,7 @@ impl Ctx {
             let mut c = Command::new("unshare");
             c.arg("--mount");
             if self.offline {
-                c.arg("--net");
+                crate::sandbox::offline(&mut c, false); // already root in our user namespace
             }
             c.args(["--", "sh", "-c", r#"mount --bind "$1" "$2" && cd "$2" && exec bash -c "$3""#, "rune-jail"])
                 .arg(&self.worktree)
@@ -379,8 +370,9 @@ impl Ctx {
                 .arg(cmd);
             c
         } else if self.offline {
-            let mut c = Command::new("unshare");
-            c.args(["--user", "--map-root-user", "--net", "bash", "-c", cmd]);
+            let mut c = Command::new("bash");
+            c.arg("-c").arg(cmd);
+            crate::sandbox::offline(&mut c, true);
             c
         } else {
             let mut c = Command::new("bash");

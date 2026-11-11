@@ -199,3 +199,24 @@ fn runner_scores_by_hidden_tests_and_resumes() {
     let j: serde_json::Value = serde_json::from_slice(&fs::read(opts.out.join("report.json")).unwrap()).unwrap();
     assert_eq!(j["cells"].as_array().unwrap().len(), 9);
 }
+
+#[test]
+fn validate_keeps_only_tasks_whose_tests_flip() {
+    let d = tempfile::tempdir().unwrap();
+    let r = d.path().join("proj");
+    fs::create_dir_all(&r).unwrap();
+    git(&r, &["init", "-q"]);
+    fs::write(r.join("calc.py"), "def add(a, b):\n    return a - b\n").unwrap();
+    fs::write(r.join("test_calc.py"), "from calc import add\n").unwrap();
+    git(&r, &["add", "-A"]);
+    git(&r, &["commit", "-qm", "start"]);
+    fs::write(r.join("calc.py"), "def add(a, b):\n    return a + b\n").unwrap();
+    fs::write(r.join("test_calc.py"), "from calc import add\nassert add(2, 2) == 4\n").unwrap();
+    git(&r, &["commit", "-qam", "Fix add"]);
+    let mut t = eval::mine(&r, &eval::MineOpts { limit: 10, max_code_lines: 100 }).unwrap().remove(0);
+    t.hidden.cmd = "python3 test_calc.py".into(); // no pytest needed
+    let scratch = d.path().join("scratch");
+    assert_eq!(eval::validate(&t, &scratch).unwrap(), (true, true));
+    t.hidden.cmd = "true".into(); // passes everywhere: nothing to do at the base
+    assert_eq!(eval::validate(&t, &scratch).unwrap(), (false, true));
+}

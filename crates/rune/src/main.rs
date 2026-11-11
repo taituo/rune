@@ -232,6 +232,12 @@ enum EvalCmd {
         /// Skip commits with a bigger code change (lines added + removed, tests excluded)
         #[arg(long, default_value_t = 300)]
         max_code_lines: u64,
+        /// Keep only tasks whose hidden tests fail at the base and pass at the commit (runs them twice)
+        #[arg(long)]
+        validate: bool,
+        /// Parallel validations
+        #[arg(long, default_value_t = 2)]
+        jobs: usize,
     },
     /// Run tasks (files or directories of *.json) under each mode, in isolated copies; resumable
     Run {
@@ -288,8 +294,36 @@ fn task_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 fn eval_cmd(cmd: &EvalCmd) -> Result<()> {
     use runestone::eval;
     match cmd {
-        EvalCmd::Mine { repo, out, limit, max_code_lines } => {
-            let tasks = eval::mine(repo, &eval::MineOpts { limit: *limit, max_code_lines: *max_code_lines })?;
+        EvalCmd::Mine { repo, out, limit, max_code_lines, validate, jobs } => {
+            let mut tasks = eval::mine(repo, &eval::MineOpts { limit: *limit, max_code_lines: *max_code_lines })?;
+            if *validate {
+                let scratch = runestone::engine::rune_home().join("tmp/validate");
+                std::fs::create_dir_all(&scratch)?;
+                let queue = std::sync::Mutex::new(tasks.iter());
+                let keep = std::sync::Mutex::new(std::collections::HashSet::new());
+                std::thread::scope(|s| {
+                    for _ in 0..(*jobs).max(1) {
+                        s.spawn(|| loop {
+                            let next = queue.lock().unwrap().next();
+                            let Some(t) = next else { break };
+                            match eval::validate(t, &scratch) {
+                                Ok((true, true)) => {
+                                    keep.lock().unwrap().insert(t.name.clone());
+                                }
+                                Ok((fails, passes)) => eprintln!(
+                                    "drop {}: hidden tests {} at the base, {} at the commit",
+                                    t.name,
+                                    if fails { "fail" } else { "already pass" },
+                                    if passes { "pass" } else { "fail" }
+                                ),
+                                Err(e) => eprintln!("drop {}: {e:#}", t.name),
+                            }
+                        });
+                    }
+                });
+                let keep = keep.into_inner().unwrap();
+                tasks.retain(|t| keep.contains(&t.name));
+            }
             std::fs::create_dir_all(out)?;
             for t in &tasks {
                 std::fs::write(out.join(format!("{}.json", t.name)), serde_json::to_string_pretty(t)? + "\n")?;

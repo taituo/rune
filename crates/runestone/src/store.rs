@@ -84,6 +84,10 @@ impl Store {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Switching to WAL and creating the schema skip SQLite's busy handler under contention ("database is
+        // locked" when two sessions start at once), so opens take turns on a lock file.
+        let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path.with_extension("open.lock"))?;
+        lock.lock()?;
         let conn = Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;

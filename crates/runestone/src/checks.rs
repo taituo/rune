@@ -140,15 +140,11 @@ pub fn run(eng: &Engine, tree: &str, cmd: &str, timeout: Duration) -> Result<Che
 /// Returns (exit, combined output, milliseconds). Exit -2 = timed out.
 pub fn exec(dir: &Path, cmd: &str, timeout: Duration) -> Result<(i64, String, u64)> {
     let start = Instant::now();
-    let mut c = if crate::agent::tools::offline_available() {
-        let mut c = Command::new("unshare");
-        c.args(["--user", "--map-root-user", "--net", "bash", "-c", cmd]);
-        c
-    } else {
-        let mut c = Command::new("bash");
-        c.arg("-c").arg(cmd);
-        c
-    };
+    let mut c = Command::new("bash");
+    c.arg("-c").arg(cmd);
+    if crate::agent::tools::offline_available() {
+        crate::sandbox::offline(&mut c, true); // no network, loopback up
+    }
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let out_path = std::env::temp_dir().join(format!("rune-check-{}-{seq}.out", std::process::id()));

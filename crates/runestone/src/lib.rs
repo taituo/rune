@@ -14,6 +14,7 @@ pub mod layer;
 pub mod objects;
 pub mod ops;
 pub mod rewind;
+pub mod sandbox;
 pub mod search;
 pub mod store;
 pub mod world;

@@ -134,3 +134,27 @@ fn no_rollback_without_a_regression() {
     assert!(!lin.iter().any(|e| e.kind == "world.rewind"));
     assert_eq!(lin.iter().filter(|e| e.kind == "check").count(), 2);
 }
+
+#[test]
+fn offline_runs_keep_loopback_but_no_network() {
+    if !runestone::agent::tools::offline_available() {
+        assert!(std::env::var("RUNE_REQUIRE_NS").is_err(), "no user namespaces (RUNE_REQUIRE_NS=1)");
+        eprintln!("SKIPPED: no user namespaces");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    // A test that serves on 127.0.0.1 and talks to itself, like a mock-server test.
+    let local = r#"python3 -c "
+import socket
+s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()
+c = socket.create_connection(s.getsockname()); print('loopback ok')
+""#;
+    let (exit, out, _) = runestone::checks::exec(dir.path(), local, std::time::Duration::from_secs(20)).unwrap();
+    assert_eq!(exit, 0, "{out}");
+    let remote = r#"python3 -c "
+import socket
+socket.create_connection(('1.1.1.1', 80), timeout=3)
+""#;
+    let (exit, _, _) = runestone::checks::exec(dir.path(), remote, std::time::Duration::from_secs(20)).unwrap();
+    assert_ne!(exit, 0, "reached the network");
+}

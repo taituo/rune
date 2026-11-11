@@ -286,6 +286,26 @@ pub fn mine(repo: &Path, opts: &MineOpts) -> Result<Vec<Task>> {
     Ok(tasks)
 }
 
+/// Is the task sound? Its hidden tests must fail at the base (else there is nothing to do) and pass at the
+/// commit they came from (else the tests or their command are broken). Returns (fails_at_base,
+/// passes_at_commit). Only for mined tasks (hidden.commit set).
+pub fn validate(task: &Task, scratch: &Path) -> Result<(bool, bool)> {
+    let commit = task.hidden.commit.clone().context("validate needs a mined task (hidden.commit)")?;
+    let timeout = Duration::from_secs(task.timeout);
+    let mut green = Vec::new();
+    for (i, base) in [task.base.clone(), Some(commit)].into_iter().enumerate() {
+        let dir = scratch.join(format!("{}.{i}", task.name));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        Task { base, ..task.clone() }.materialize(&dir)?;
+        task.apply_hidden(&dir)?;
+        let (exit, _, _) = checks::exec(&dir, &task.hidden.cmd, timeout)?;
+        green.push(exit == 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    Ok((!green[0], green[1]))
+}
+
 // ---------------------------------------------------------------- runner
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
