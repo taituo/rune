@@ -43,8 +43,15 @@ enum PermArg {
 
 #[derive(clap::Args, Clone)]
 struct AgentArgs {
-    #[arg(long, default_value = "claude-opus-5-5")]
-    model: String,
+    /// anthropic | openai (chat/completions-compatible gateway). Default: $RUNE_API, else anthropic
+    #[arg(long)]
+    api: Option<String>,
+    /// API base URL (default: $RUNE_BASE_URL; for anthropic also $ANTHROPIC_BASE_URL)
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Model id (default: $RUNE_MODEL, else claude-opus-5-5; see `rune models` for a gateway's ids)
+    #[arg(long)]
+    model: Option<String>,
     /// low | medium | high | xhigh | max (default: the model's)
     #[arg(long)]
     effort: Option<String>,
@@ -84,6 +91,12 @@ enum Cmd {
     },
     /// Print the conversation exactly as the model will see it next
     Transcript,
+    /// List the model ids an OpenAI-compatible gateway serves
+    Models {
+        /// Gateway base URL (default: $RUNE_BASE_URL)
+        #[arg(long)]
+        base_url: Option<String>,
+    },
     /// Run N attempts in parallel from the current state, one per hypothesis, each in its own overlay
     /// fork; pick the best by hidden tests, then visible ones, then smallest diff; merge it keep-human
     Search {
@@ -258,10 +271,20 @@ fn run(cli: Cli) -> Result<()> {
         install(harness);
         return Ok(());
     }
+    if let Cmd::Models { base_url } = &cli.cmd {
+        let base = base_url.clone().or_else(|| std::env::var("RUNE_BASE_URL").ok()).context("pass --base-url or set RUNE_BASE_URL")?;
+        let key = std::env::var("OPENAI_API_KEY").ok().filter(|k| !k.is_empty());
+        for m in runestone::agent::openai::list_models(&base, key.as_deref())? {
+            println!("{m}");
+        }
+        return Ok(());
+    }
 
     let eng = Engine::open(&dir)?;
     let opts = |a: &AgentArgs, default: PermArg| agent_cli::Opts {
-        model: a.model.clone(),
+        api: a.api.clone().or_else(|| std::env::var("RUNE_API").ok()).unwrap_or_else(|| "anthropic".into()),
+        base_url: a.base_url.clone().or_else(|| std::env::var("RUNE_BASE_URL").ok()),
+        model: a.model.clone().or_else(|| std::env::var("RUNE_MODEL").ok()).unwrap_or_else(|| "claude-opus-5-5".into()),
         effort: a.effort.clone(),
         mode: match a.mode.unwrap_or(default) {
             PermArg::Ask => runestone::agent::Permission::Ask,
@@ -300,7 +323,8 @@ fn run(cli: Cli) -> Result<()> {
             };
             if !has_session {
                 let cfg = runestone::agent::Config {
-                    model: a.model.clone(),
+                    api: o.api.clone(),
+                    model: o.model.clone(),
                     effort: a.effort.clone(),
                     thinking_display: a.show_thinking.then(|| "summarized".to_string()),
                     ..Default::default()
@@ -328,12 +352,17 @@ fn run(cli: Cli) -> Result<()> {
                 keep_dirs: *keep_dirs,
             };
             let script = script.clone();
+            let api = runestone::agent::session::api_of(&eng.store, &branch)?;
+            if script.is_none() {
+                agent_cli::provider(&api, o.base_url.as_deref())?; // fail early on missing key or URL
+            }
+            let base_url = o.base_url.clone();
             let factory = move |i: usize| -> Box<dyn runestone::agent::model::Provider> {
                 match &script {
                     Some(dir) => Box::new(
                         runestone::agent::model::Scripted::from_file(&dir.join(format!("attempt-{i}.json"))).expect("script file"),
                     ),
-                    None => Box::new(runestone::agent::model::Anthropic::from_env().expect("ANTHROPIC_API_KEY")),
+                    None => agent_cli::provider(&api, base_url.as_deref()).expect("provider"),
                 }
             };
             let r = runestone::search::run(&eng, &branch, &spec, &factory)?;
@@ -502,7 +531,7 @@ fn run(cli: Cli) -> Result<()> {
             let ev = eng.record_tree(&branch, "check", &tree, json!({ "cmd": cmd, "exit": r.exit, "score": r.score, "cached": r.cached, "duration_ms": r.duration_ms, "output": r.tail }))?;
             println!("{} {} (passed {}, failed {}, {}){}", if r.score.green { "✓" } else { "✗" }, cmd, r.score.passed, r.score.failed, if r.cached { "cached".into() } else { format!("{} ms", r.duration_ms) }, format!("  [{}]", ev.short()));
         }
-        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Chat { .. } | Cmd::Run { .. } | Cmd::Search { .. } => unreachable!(),
+        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Chat { .. } | Cmd::Run { .. } | Cmd::Search { .. } | Cmd::Models { .. } => unreachable!(),
     }
     Ok(())
 }

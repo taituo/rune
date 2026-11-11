@@ -19,18 +19,38 @@ scripts/fixtures.sh ~/rune-fixtures           # calc, calc-hidden, trap
 
 Optional: `export RUNE_HOME=~/rune-test-home` keeps the test record apart from real use.
 
+**OpenAI-compatible gateway instead of Anthropic.** rune speaks chat/completions too:
+
+```sh
+export RUNE_API=openai RUNE_BASE_URL=http://10.91.1.1:8788    # with or without /v1
+export OPENAI_API_KEY=…                                        # only if the gateway wants one
+rune models                                                    # pick an id from this list
+export RUNE_MODEL=<id>
+```
+
+The API is fixed per session (stored at its start), so `rune chat -r` keeps using the gateway.
+
+**If `unshare … true` fails** (`write failed /proc/self/uid_map: Operation not permitted`), unprivileged user
+namespaces are blocked: usually Ubuntu's AppArmor setting, or running inside a container. Then:
+
+- steps 1–4 still work, but use `--mode ask` or `--mode auto`: without the offline sandbox, dry mode blocks every
+  command rune cannot classify, including `python3 test_visible.py`;
+- step 5 (search) needs namespaces. On Ubuntu: `sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0`
+  (until reboot), or run in a VM.
+
 ## 1. Does it talk to the API at all? (2 min)
 
 ```sh
 cd ~/rune-fixtures/calc
-rune run "List the files here and say in one line what calc.py does. Do not change anything."
+rune run --mode ask "List the files here and say in one line what calc.py does. Do not change anything."
 rune verify
 ```
 
 Expect: streamed text, a few Read/Glob calls, and a final line like `[s/… · 3 steps · end_turn · in … · cache read …]`.
 `rune verify` should end with `N model requests re-rendered …, 0 differ`.
 
-Note: any HTTP error (copy it whole), the step count, and the cache-read percentage.
+Note: any HTTP error (copy it whole), the step count, and the cache-read percentage (gateways that do not
+report cached tokens show 0%).
 
 ## 2. A real fix with checks (5 min)
 

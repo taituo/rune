@@ -28,6 +28,8 @@ design notes doc ("rune: design notes, deep pass").
 
 ## Next: make it real
 
+- [x] OpenAI-compatible provider (chat/completions) for gateways; `rune models`; exact re-render kept.
+- [ ] Search without user namespaces (plain directory forks + scan snapshots) for machines that block them.
 - [ ] Run TESTING.md steps 0–6 against the real API; fix what breaks.
 - [ ] Ask the model for N distinct hypotheses (one call) instead of requiring `--hyp`; check whether attempts
       actually differ.

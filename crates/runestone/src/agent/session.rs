@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// "anthropic" (Messages API) or "openai" (chat/completions). Fixed for the life of a session.
+    pub api: String,
     pub model: String,
     pub max_tokens: u64,
     pub effort: Option<String>,
@@ -24,7 +26,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { model: "claude-opus-5-5".into(), max_tokens: 32_000, effort: None, thinking_display: None }
+        Config { api: "anthropic".into(), model: "claude-opus-5-5".into(), max_tokens: 32_000, effort: None, thinking_display: None }
     }
 }
 
@@ -109,6 +111,13 @@ pub struct Checks {
 
 const MAX_ROLLBACKS: usize = 3;
 
+/// The API a branch's session speaks ("anthropic" when the spawn predates the setting).
+pub fn api_of(store: &Store, branch: &str) -> Result<String> {
+    let Some(h) = store.head(branch)? else { return Ok("anthropic".into()) };
+    let chain = effective_chain(store, &h)?;
+    Ok(spawn_config(&chain).and_then(|s| s.body["config"]["api"].as_str().map(String::from)).unwrap_or_else(|| "anthropic".into()))
+}
+
 /// Render the exact request for the conversation at the end of `chain`.
 pub fn render(store: &Store, chain: &[Event]) -> Result<Vec<u8>> {
     let spawn = spawn_config(chain).context("this branch has no rune session; start one with `rune chat`")?;
@@ -116,6 +125,9 @@ pub fn render(store: &Store, chain: &[Event]) -> Result<Vec<u8>> {
     let system = String::from_utf8(store.blob(spawn.str("system").unwrap_or_default())?)?;
     let tools: Value = serde_json::from_slice(&store.blob(spawn.str("tools").unwrap_or_default())?)?;
     let folded = fold(store, chain)?;
+    if cfg["api"].as_str() == Some("openai") {
+        return Ok(serde_json::to_vec(&super::openai::render(cfg, &system, &tools, &folded.messages))?);
+    }
     let mut body = json!({
         "model": cfg["model"],
         "max_tokens": cfg["max_tokens"],
@@ -169,7 +181,7 @@ impl<'a> Session<'a> {
                 "harness": "rune",
                 "system": system,
                 "tools": tools,
-                "config": { "model": cfg.model, "max_tokens": cfg.max_tokens, "effort": cfg.effort, "thinking_display": cfg.thinking_display },
+                "config": { "api": cfg.api, "model": cfg.model, "max_tokens": cfg.max_tokens, "effort": cfg.effort, "thinking_display": cfg.thinking_display },
             }),
         )
     }

@@ -7,7 +7,7 @@ conversation is a fold over the same events, so a rewind or fork moves the messa
 ## Agent loop
 
 ```sh
-export ANTHROPIC_API_KEY=…
+export ANTHROPIC_API_KEY=…        # or: RUNE_API=openai RUNE_BASE_URL=http://gateway:8788 (chat/completions)
 rune chat                         # new session (default mode: ask before outside-world actions)
 rune chat -r                      # resume the latest session in this worktree
 rune run "fix the failing test"   # one request, then exit (default mode: dry)
@@ -33,7 +33,7 @@ targets the last passing check.
 | Bash | Own process group, output to a file (background children don't block), timeout kills the group, head+tail clipping. |
 | Checks | At stable points (turn end, optionally every N changing calls) the recorded world is built and tested in a long-lived per-worktree workspace moved by changed files only, so build caches stay warm; offline when possible. Results keyed by (tree, cmd): a world is never checked twice. Scores parsed from cargo, pytest, jest and go output, or `rune-score: N`. Failures and recoveries reach the model as harness notes. |
 | Auto-rollback | After N consecutive checks worse than the best, a keep-human rewind to the best checked state, with the undone attempts listed for the model. At most 3 per request; never past an outside-world action. Abandoned branches stay in the record, and every recorded tree is pinned with a ref so git gc cannot collect them. |
-| Model | Anthropic Messages API, SSE streaming accumulated into the non-streaming shape, retries on 429/5xx/529 and stream errors. `--model`, `--effort`, `--show-thinking`. |
+| Model | Anthropic Messages API, or any OpenAI-compatible chat/completions gateway (`--api openai --base-url …`, `rune models`). The record keeps one block format; each session renders its requests for its API deterministically, so `rune verify` holds for both. SSE streaming accumulated into the non-streaming shape (tool-call fragments, usage incl. cached tokens), retries on 429/5xx/529 and stream errors. `--model`, `--effort`, `--show-thinking`. |
 
 See [TESTING.md](TESTING.md) for how to try it with a real model, [docs/TODO.md](docs/TODO.md) for what is next, and [docs/versioned-worlds.md](docs/versioned-worlds.md) for the original idea document.
 

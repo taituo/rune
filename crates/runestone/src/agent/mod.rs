@@ -3,6 +3,7 @@
 
 pub mod fold;
 pub mod model;
+pub mod openai;
 pub mod prompt;
 pub mod session;
 pub mod tools;

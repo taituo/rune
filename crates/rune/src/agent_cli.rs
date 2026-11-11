@@ -115,6 +115,8 @@ impl Ui for StdUi {
 }
 
 pub struct Opts {
+    pub api: String,
+    pub base_url: Option<String>,
     pub model: String,
     pub effort: Option<String>,
     pub mode: Permission,
@@ -125,6 +127,20 @@ pub struct Opts {
     pub check: Option<String>,
     pub check_every: usize,
     pub rollback_after: usize,
+}
+
+/// The provider for a session's API. A resumed session keeps the API it was started with.
+pub fn provider(api: &str, base_url: Option<&str>) -> Result<Box<dyn runestone::agent::model::Provider>> {
+    match api {
+        "openai" => Ok(Box::new(runestone::agent::openai::OpenAi::from_env(base_url)?)),
+        "anthropic" => {
+            if let Some(b) = base_url {
+                std::env::set_var("ANTHROPIC_BASE_URL", b);
+            }
+            Ok(Box::new(Anthropic::from_env()?))
+        }
+        other => anyhow::bail!("unknown --api {other} (anthropic | openai)"),
+    }
 }
 
 /// Pick or create the branch: an explicit name, the latest one (--resume), or a fresh session.
@@ -140,6 +156,7 @@ fn open_session<'a>(eng: &'a Engine, branch: Option<&str>, o: &Opts) -> Result<S
     };
     if !has_session {
         let cfg = Config {
+            api: o.api.clone(),
             model: o.model.clone(),
             effort: o.effort.clone(),
             thinking_display: o.show_thinking.then(|| "summarized".to_string()),
@@ -147,10 +164,11 @@ fn open_session<'a>(eng: &'a Engine, branch: Option<&str>, o: &Opts) -> Result<S
         };
         Session::spawn(eng, &name, &cfg, &today())?;
     }
+    let prov = provider(&agent::session::api_of(&eng.store, &name)?, o.base_url.as_deref())?;
     Ok(Session {
         eng,
         branch: name,
-        provider: Box::new(Anthropic::from_env()?),
+        provider: prov,
         ui: Box::new(StdUi::default()),
         perm: o.mode,
         max_steps: o.max_steps,
@@ -194,8 +212,9 @@ pub fn usage_line(u: &agent::session::Usage) -> String {
 pub fn chat(eng: &Engine, branch: Option<&str>, o: &Opts) -> Result<()> {
     let mut s = open_session(eng, branch, o)?;
     eprintln!(
-        "{DIM}rune · {} · {} · checks: {} · /help for commands{OFF}",
+        "{DIM}rune · {} · {} · {} · checks: {} · /help for commands{OFF}",
         short_branch(&s.branch),
+        agent::session::api_of(&eng.store, &s.branch).unwrap_or_default(),
         eng.world.worktree.display(),
         s.checks.as_ref().map(|c| c.cmd.as_str()).unwrap_or("off")
     );
