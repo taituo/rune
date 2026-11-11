@@ -50,7 +50,9 @@ check and by held-out tests that are stacked over the attempt's layer only at ev
 can neither read nor overwrite them. The best attempt (passes held-out, then highest scores, then smallest
 diff) is merged into the live worktree keep-human, and the session continues from its conversation. The
 others stay as `search/<id>/<i>` branches with their worlds pinned. Forks show the main worktree's path to
-the agent, so the winner's conversation stays valid after the fork directory is removed.
+the agent, and each Bash command in a fork runs in its own mount namespace with the fork bind-mounted over
+that path, so even indirect paths land in the fork; the winner's conversation stays valid after the fork
+directory is removed.
 
 Needs unprivileged user namespaces (`unshare`, overlayfs with `userxattr`); the CLI re-executes itself
 inside one. `--script DIR` runs scripted attempts (`attempt-<i>.json`) instead of a model.
@@ -114,9 +116,8 @@ Without hooks you can drive it by hand: `rune record turn.start|tool.pre|tool.po
 - No daemon/JSON-RPC yet; the library API is the API.
 - No compaction yet (1M context); record-built compaction is next.
 - No Ctrl-C interrupt inside a turn; killing the process is safe (resume closes dangling calls).
-- Search forks map the main worktree's path in tool arguments, outputs and Bash command strings only; a
-  path built indirectly (env var, symlink, a script) can still reach the live tree. Real isolation needs a
-  per-attempt mount namespace that mounts the fork at the main path.
+- In search forks, Bash runs in a mount namespace with the fork mounted over the main worktree path; the file
+  tools map paths by prefix, so an absolute symlink to the main path is still followed to the live tree.
 - Per-event cost is dominated by git subprocesses; next step is in-process object and tree writing.
 
 ## Tests

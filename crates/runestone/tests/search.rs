@@ -98,6 +98,9 @@ fn hidden_tests_pick_the_honest_fix() {
             msg(vec![edit("e3", "return a - b", "return sum([a, b])")]),
             msg(vec![tool_use("w3", "Write", json!({ "file_path": "NOTES.md", "content": "Rewrote add.\n".repeat(30) }))]),
             msg(vec![tool_use("b3", "Bash", json!({ "command": format!("cd {} && echo stray > STRAY.txt && pwd", std::env::var("RUNE_TEST_MAIN").unwrap()) }))]),
+            // An indirect path: the main worktree's path only appears inside a file, never in the command.
+            msg(vec![tool_use("w3b", "Write", json!({ "file_path": "where.txt", "content": std::env::var("RUNE_TEST_MAIN").unwrap() }))]),
+            msg(vec![tool_use("b3b", "Bash", json!({ "command": "cd \"$(cat where.txt)\" && echo escaped > ESCAPE.txt" }))]),
             msg(vec![text("Fixed with sum().")]),
         ],
         // 4: tampers with the visible test instead of the code
@@ -159,6 +162,10 @@ fn hidden_tests_pick_the_honest_fix() {
     assert!(fs::read_to_string(d.join("test_visible.py")).unwrap().contains("run([('add(2, 2)', 4)], globals())"));
     assert!(!d.join("NOTES.md").exists());
     assert!(!d.join("STRAY.txt").exists(), "a fork's shell command escaped into the live worktree");
+    assert!(!d.join("ESCAPE.txt").exists(), "an indirect path let a fork's command escape into the live worktree");
+    let t3 = r.outcomes[3].tree.as_ref().unwrap();
+    let files3 = eng.world.git(&["ls-tree", "--name-only", t3]).unwrap();
+    assert!(files3.contains("ESCAPE.txt") && files3.contains("STRAY.txt"), "the writes landed in attempt 3's own world: {files3}");
     assert!(!d.join("test_hidden.py").exists(), "hidden tests never reach the worktree");
 
     // The session continues from the winner's conversation; losers remain as branches.

@@ -55,7 +55,10 @@ design notes doc ("rune: design notes, deep pass").
 
 ## Correctness and isolation
 
-- [ ] Per-attempt mount namespace that mounts the fork at the main worktree path (replaces string mapping of paths).
+- [x] Fork Bash commands run in their own mount namespace with the fork bind-mounted over the main worktree
+      path, so indirect paths (env vars, paths read from files) land in the fork. Tested.
+- [ ] File tools (Read/Write/Edit) still map paths by prefix; a symlink in the tree pointing at the absolute main
+      path would be followed to the live tree.
 - [ ] Per-hunk parking instead of whole-file parking on conflict.
 - [ ] Rewind plan reports excluded paths that changed (cannot be restored).
 - [ ] Two sessions in one worktree share the shadow index: lock or separate it.

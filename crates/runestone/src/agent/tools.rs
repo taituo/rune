@@ -315,15 +315,21 @@ impl Ctx {
         if raw.trim().is_empty() {
             return Ok(Outcome::err("command is empty"));
         }
-        // In a fork, the agent addresses the main worktree's path; point it at the fork instead.
-        // String-level only: a path built indirectly (env var, symlink) can still reach the real tree.
+        // In a fork, the agent addresses the main worktree's path. Inside rune's namespace the command runs in
+        // its own mount namespace where the fork is bind-mounted over that path, so every route to the main
+        // path (literal, env var, a path read from a file, a symlink) lands in the fork. Outside it, fall
+        // back to rewriting the literal path in the command string.
+        let jail = match &self.alias {
+            Some(a) if crate::layer::in_namespace() => Some(a.clone()),
+            _ => None,
+        };
         let mapped;
-        let cmd = match &self.alias {
-            Some(a) => {
+        let cmd = match (&self.alias, &jail) {
+            (Some(a), None) => {
                 mapped = raw.replace(&*a.to_string_lossy(), &self.worktree.to_string_lossy());
                 mapped.as_str()
             }
-            None => raw,
+            _ => raw,
         };
         let timeout = Duration::from_millis(input["timeout"].as_u64().unwrap_or(120_000).clamp(1_000, 600_000));
         std::fs::create_dir_all(&self.tmp)?;
@@ -332,7 +338,18 @@ impl Ctx {
         let out_path = self.tmp.join(format!("bash-{}-{:x}.out", std::process::id(), rand_u64()));
         let out_file = std::fs::File::create(&out_path)?;
         let err_file = out_file.try_clone()?;
-        let mut command = if self.offline {
+        let mut command = if let Some(main) = &jail {
+            let mut c = Command::new("unshare");
+            c.arg("--mount");
+            if self.offline {
+                c.arg("--net");
+            }
+            c.args(["--", "sh", "-c", r#"mount --bind "$1" "$2" && cd "$2" && exec bash -c "$3""#, "rune-jail"])
+                .arg(&self.worktree)
+                .arg(main)
+                .arg(cmd);
+            c
+        } else if self.offline {
             let mut c = Command::new("unshare");
             c.args(["--user", "--map-root-user", "--net", "bash", "-c", cmd]);
             c
