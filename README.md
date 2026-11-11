@@ -1,15 +1,40 @@
 # rune
 
-Versioned worlds for coding agents. World and conversation share one state id: an event in a
-content-addressed DAG. Every event snapshots the worktree, is attributed by construction, and can be
-rewound to or forked from. The agent loop is a swappable part; `runestone` never talks to a model.
+A coding agent whose conversation and world are versioned together. Both share one state id: an event in a
+content-addressed DAG. Every event snapshots the worktree and is attributed by construction. The
+conversation is a fold over the same events, so a rewind or fork moves the messages and the files at once.
+
+## Agent loop
+
+```sh
+export ANTHROPIC_API_KEY=…
+rune chat                         # new session (default mode: ask before outside-world actions)
+rune chat -r                      # resume the latest session in this worktree
+rune run "fix the failing test"   # one request, then exit (default mode: dry)
+rune transcript                   # the conversation exactly as the model will see it next
+rune verify                       # re-render every sent request from the record, compare bytes
+```
+
+In chat: `/rewind N [hard]`, `/undo`, `/fork N DIR`, `/log`, `/continue`, `/verify`.
+
+| Piece | How |
+|---|---|
+| Conversation = fold | Messages are rebuilt from the effective chain on every step. A `world.rewind` jumps to its target and appends a note, so history stays append-only (prompt cache and thinking signatures stay valid). There is no separate message store. |
+| Exact data | The rendered request bytes of every model call are stored (content-addressed). `rune verify` re-renders them from the record; a mismatch means the record no longer explains what the model saw. The system prompt and tool schemas are stored once at spawn and reused byte for byte. |
+| Tools | Read, Write, Edit, Bash, Grep, Glob (the shapes current models are trained on), plus Rewind. |
+| Read-before-write | Every Read and Write pins the content hash the agent saw. Edit/Write refuse a file not read, or changed since. Rebuilt from the record on resume. |
+| Self-rewind | `Rewind{point, lesson ≤300 chars, evidence}` restores conversation and files (keep-human) to the start of the current request or before a given call, then continues with only the lesson (plus the request, repeated). Max 3 per request; never past an outside-world action without a human. |
+| Dry world | `--mode dry`: known outside-world actions (push, deploy, HTTP writes, MCP writes) are blocked; commands rune cannot classify run in an unprivileged user+network namespace, so they change the workspace but cannot reach outside. `--mode ask` asks; `--mode auto` runs everything. |
+| Bash | Own process group, output to a file (background children don't block), timeout kills the group, head+tail clipping. |
+| Model | Anthropic Messages API, SSE streaming accumulated into the non-streaming shape, retries on 429/5xx/529 and stream errors. `--model`, `--effort`, `--show-thinking`. |
+
+## Versioned world
 
 ```
 crates/runestone   engine (library): store, world, attribution, rewind, fork/bisect, classifier, hooks
 crates/rune        CLI
 ```
 
-## What works (v1)
 
 | Piece | How |
 |---|---|
@@ -25,7 +50,7 @@ crates/rune        CLI
 | Hooks | `rune hook` ingests Claude Code and Kiro hook JSON. Fails open (writes a `gap` event). `RUNE_DRY_WORLD=1` blocks compensable/irreversible/unknown at pre-tool (exit 2). |
 | Bench | `rune bench` → cold and warm p50/p95 snapshot latency. 20k files: ~360 ms cold, ~25–40 ms warm. |
 
-## Use
+## World commands
 
 ```sh
 cargo build --release
@@ -53,8 +78,12 @@ Without hooks you can drive it by hand: `rune record turn.start|tool.pre|tool.po
 - No mechanical-change detection, cgroups/fanotify, mtime handling beyond "restored files are written now".
 - Excluded paths are never restored and not yet reported as "changed but excluded".
 - No daemon/JSON-RPC yet; the library API is the API.
+- No compaction yet (1M context); record-built compaction is next.
+- No Ctrl-C interrupt inside a turn; killing the process is safe (resume closes dangling calls).
 
 ## Tests
 
-`cargo test` covers attribution, keep-human rewind, dependent-hunk parking, hard rewind + external guard,
+`cargo test`: agent loop with a scripted model (exact re-render, append-only history, read guard,
+self-rewind, dry world, offline sandbox, human rewind + continue), the HTTP/SSE provider against a mock
+server (retry, thinking + signature, tool input JSON), and attribution, keep-human rewind, dependent-hunk parking, hard rewind + external guard,
 plan/apply race, fork, bisect with cache, id verification, the classifier table and hook ingestion.

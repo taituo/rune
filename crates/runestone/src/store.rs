@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS heads (
   id      TEXT NOT NULL,
   updated REAL NOT NULL
 );
+-- Content-addressed bytes: rendered model requests, large tool results, system prompts.
+CREATE TABLE IF NOT EXISTS blobs (
+  hash  TEXT PRIMARY KEY,
+  bytes BLOB NOT NULL
+);
 -- Results keyed by content: (tree, command) -> outcome. Branches converge on the same tree often.
 CREATE TABLE IF NOT EXISTS results (
   tree    TEXT NOT NULL,
@@ -186,6 +191,20 @@ impl Store {
             .prepare("SELECT name, id, updated FROM heads WHERE name LIKE ?1 || '%' ORDER BY updated DESC")?;
         let rows = stmt.query_map(params![prefix], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
+        let hash = hex::encode(Sha256::digest(bytes));
+        self.conn
+            .execute("INSERT OR IGNORE INTO blobs (hash, bytes) VALUES (?1, ?2)", params![hash, bytes])?;
+        Ok(hash)
+    }
+
+    pub fn blob(&self, hash: &str) -> Result<Vec<u8>> {
+        self.conn
+            .query_row("SELECT bytes FROM blobs WHERE hash = ?1", params![hash], |r| r.get(0))
+            .optional()?
+            .with_context(|| format!("no blob {hash}"))
     }
 
     pub fn result(&self, tree: &str, cmd: &str) -> Result<Option<(i64, String)>> {

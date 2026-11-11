@@ -1,3 +1,5 @@
+mod agent_cli;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use runestone::rewind::{self, Mode};
@@ -8,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "rune", version, about = "Versioned worlds for coding agents")]
+#[command(name = "rune", version, about = "A coding agent whose conversation and world are versioned together")]
 struct Cli {
     /// Worktree (default: current directory)
     #[arg(short = 'C', long, global = true)]
@@ -29,8 +31,50 @@ enum ModeArg {
     Hard,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum PermArg {
+    /// Ask before compensable, irreversible or unknown actions
+    Ask,
+    /// Block them
+    Dry,
+    /// Run everything
+    Auto,
+}
+
+#[derive(clap::Args, Clone)]
+struct AgentArgs {
+    #[arg(long, default_value = "claude-opus-5-5")]
+    model: String,
+    /// low | medium | high | xhigh | max (default: the model's)
+    #[arg(long)]
+    effort: Option<String>,
+    #[arg(long, value_enum)]
+    mode: Option<PermArg>,
+    /// Stream summarized thinking
+    #[arg(long)]
+    show_thinking: bool,
+    /// Continue the most recent session in this worktree
+    #[arg(long, short = 'r')]
+    resume: bool,
+    #[arg(long, default_value_t = 400)]
+    max_steps: usize,
+}
+
 #[derive(Subcommand)]
 enum Cmd {
+    /// Interactive session with rune's own agent loop
+    Chat {
+        #[command(flatten)]
+        a: AgentArgs,
+    },
+    /// Run one request and exit (default mode: dry)
+    Run {
+        #[command(flatten)]
+        a: AgentArgs,
+        prompt: Vec<String>,
+    },
+    /// Print the conversation exactly as the model will see it next
+    Transcript,
     /// Ingest a harness hook event from stdin (fails open)
     Hook {
         #[arg(long, default_value = "claude")]
@@ -159,6 +203,32 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     let eng = Engine::open(&dir)?;
+    let opts = |a: &AgentArgs, default: PermArg| agent_cli::Opts {
+        model: a.model.clone(),
+        effort: a.effort.clone(),
+        mode: match a.mode.unwrap_or(default) {
+            PermArg::Ask => runestone::agent::Permission::Ask,
+            PermArg::Dry => runestone::agent::Permission::Dry,
+            PermArg::Auto => runestone::agent::Permission::Auto,
+        },
+        show_thinking: a.show_thinking,
+        resume: a.resume,
+        max_steps: a.max_steps,
+    };
+    match &cli.cmd {
+        Cmd::Chat { a } => return agent_cli::chat(&eng, cli.branch.as_deref(), &opts(a, PermArg::Ask)),
+        Cmd::Run { a, prompt } => {
+            let p = if prompt.is_empty() {
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                s
+            } else {
+                prompt.join(" ")
+            };
+            return agent_cli::run_once(&eng, cli.branch.as_deref(), &opts(a, PermArg::Dry), p.trim());
+        }
+        _ => {}
+    }
     let branch = match &cli.branch {
         Some(b) => eng.branch(b),
         None => eng.latest_branch()?.unwrap_or_else(|| eng.branch("main")),
@@ -266,12 +336,21 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Verify => {
             let lin = eng.lineage(&branch)?;
             let bad: Vec<&Event> = lin.iter().filter(|e| !runestone::store::verify(e)).collect();
-            println!("{} events, {} mismatched", lin.len(), bad.len());
+            println!("{} events, {} mismatched ids", lin.len(), bad.len());
             for e in bad {
                 println!("  {}", e.id);
             }
+            if lin.iter().any(|e| e.kind == "model.call") {
+                let r = runestone::agent::verify_requests(&eng, &branch)?;
+                let bad: Vec<&String> = r.iter().filter(|x| !x.1).map(|x| &x.0).collect();
+                println!("{} model requests re-rendered from the record, {} differ from what was sent", r.len(), bad.len());
+                for b in bad {
+                    println!("  {b}");
+                }
+            }
         }
-        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } => unreachable!(),
+        Cmd::Transcript => agent_cli::transcript(&eng, &branch, cli.json)?,
+        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Chat { .. } | Cmd::Run { .. } => unreachable!(),
     }
     Ok(())
 }

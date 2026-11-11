@@ -214,8 +214,41 @@ impl Plan {
     }
 }
 
+/// What the rewound agent is told: paths and facts only, marked as coming from the harness.
+pub fn note(plan: &Plan, lesson: Option<(&str, &str)>, prompt: Option<&str>) -> String {
+    let mut s = String::from("[harness event, not from the user] ");
+    match lesson {
+        Some(_) => s += &format!("You rewound yourself to an earlier point (turn {}). Everything after it is forgotten, and the files were restored to match, keeping changes made by others.", plan.target_turn),
+        None => s += &format!("The conversation and the world were restored to the end of turn {}. Changes made by others were kept.", plan.target_turn),
+    }
+    let kept: std::collections::BTreeSet<&String> = plan.kept.iter().flat_map(|k| &k.changed).collect();
+    if !kept.is_empty() {
+        s += &format!("\nKept outside changes: {}.", kept.into_iter().cloned().collect::<Vec<_>>().join(", "));
+    }
+    if !plan.parked.is_empty() {
+        let p: Vec<String> = plan.parked.iter().flat_map(|p| p.paths.clone()).collect();
+        s += &format!("\nParked (others' edits that depended on removed work, not applied): {}.", p.join(", "));
+    }
+    if !plan.external.is_empty() {
+        let e: Vec<String> = plan.external.iter().map(|e| format!("{} (turn {})", e.label, e.turn)).collect();
+        s += &format!("\nStill live in the outside world, not undone: {}.", e.join("; "));
+    }
+    if let Some((lesson, evidence)) = lesson {
+        s += &format!("\nLesson: {lesson}\nEvidence: {evidence}");
+    }
+    if let Some(p) = prompt {
+        s += &format!("\nThe user's current request, repeated verbatim:\n{p}");
+    }
+    s
+}
+
 /// Apply a plan: park patches, check out the result, append a `world.rewind` event.
 pub fn apply(eng: &Engine, plan: &Plan, accept_external: bool) -> Result<Event> {
+    apply_with(eng, plan, accept_external, json!({ "note": note(plan, None, None), "turn": plan.target_turn }))
+}
+
+/// Apply with extra body fields (self-rewind adds lesson, task, note and the turn it continues as).
+pub fn apply_with(eng: &Engine, plan: &Plan, accept_external: bool, extra: Value) -> Result<Event> {
     if !plan.external.is_empty() && !accept_external {
         bail!("{} external actions stay live after this rewind; pass --accept-external", plan.external.len());
     }
@@ -232,20 +265,18 @@ pub fn apply(eng: &Engine, plan: &Plan, accept_external: bool) -> Result<Event> 
         parked_files.push(json!({ "event": p.event, "paths": p.paths, "file": f.to_string_lossy() }));
     }
     let pre = eng.world.checkout(&plan.result_tree)?;
-    let target = eng.store.get(&plan.target)?;
-    eng.record_tree(
-        &plan.branch,
-        "world.rewind",
-        &plan.result_tree,
-        json!({
-            "target": plan.target,
-            "pre_tree": pre,
-            "mode": plan.mode,
-            "parked": parked_files,
-            "rewound_turn": target.turn().unwrap_or(0),
-            "external_live": plan.external,
-        }),
-    )
+    let mut body = json!({
+        "target": plan.target,
+        "pre_tree": pre,
+        "mode": plan.mode,
+        "parked": parked_files,
+        "rewound_turn": plan.target_turn,
+        "external_live": plan.external,
+    });
+    if let (Value::Object(b), Value::Object(x)) = (&mut body, extra) {
+        b.extend(x);
+    }
+    eng.record_tree(&plan.branch, "world.rewind", &plan.result_tree, body)
 }
 
 /// Undo the last rewind on a branch: restore its pre-rewind tree exactly.
@@ -258,5 +289,16 @@ pub fn undo(eng: &Engine, branch: &str) -> Result<Event> {
         .ok_or_else(|| anyhow::anyhow!("no rewind to undo on {branch}"))?;
     let pre = last.str("pre_tree").unwrap_or_default().to_string();
     let before = eng.world.checkout(&pre)?;
-    eng.record_tree(branch, "world.rewind", &pre, json!({ "undo": last.id, "pre_tree": before, "mode": "undo" }))
+    // The conversation goes back to where it was before that rewind (its parent).
+    let parent_turn = match last.parents.first() {
+        Some(p) => eng.store.get(p)?.turn().unwrap_or(0),
+        None => 0,
+    };
+    eng.record_tree(
+        branch,
+        "world.rewind",
+        &pre,
+        json!({ "undo": last.id, "pre_tree": before, "mode": "undo", "turn": parent_turn,
+                "note": "[harness event, not from the user] The last rewind was undone; the conversation and the world are back where they were before it." }),
+    )
 }

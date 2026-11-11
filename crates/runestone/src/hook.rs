@@ -56,7 +56,7 @@ pub fn summary(tool: &str, input: &Value) -> String {
 }
 
 /// Truncate large strings in a tool input before it goes into the record.
-fn shrink(v: &Value) -> Value {
+pub fn shrink(v: &Value) -> Value {
     match v {
         Value::String(s) if s.len() > 4096 => json!(format!("{}… [{} bytes]", clip(s, 1024), s.len())),
         Value::Array(a) => Value::Array(a.iter().map(shrink).collect()),

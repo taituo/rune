@@ -1,0 +1,308 @@
+//! `rune chat` and `rune run`: rune's own agent loop in the terminal. Plain streaming output; the API is
+//! the library, so a richer UI is just another client.
+
+use anyhow::{Context, Result};
+use runestone::agent::fold::{effective_chain, fold};
+use runestone::agent::model::Anthropic;
+use runestone::agent::{self, Config, Permission, Session, Ui};
+use runestone::classify::{Class, State};
+use runestone::rewind::{self, Mode};
+use runestone::{ops, Engine};
+use serde_json::Value;
+use std::io::{BufRead, Write};
+use std::path::PathBuf;
+
+const DIM: &str = "\x1b[2m";
+const CYAN: &str = "\x1b[36m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
+const OFF: &str = "\x1b[0m";
+
+#[derive(Default)]
+pub struct StdUi {
+    mid_line: bool,
+    in_thinking: bool,
+    pub tokens_in: u64,
+    pub tokens_cached: u64,
+    pub tokens_out: u64,
+}
+
+impl StdUi {
+    fn newline(&mut self) {
+        if self.mid_line {
+            println!();
+            self.mid_line = false;
+        }
+        if self.in_thinking {
+            print!("{OFF}");
+            self.in_thinking = false;
+        }
+    }
+}
+
+impl Ui for StdUi {
+    fn text(&mut self, t: &str) {
+        if self.in_thinking {
+            println!("{OFF}");
+            self.in_thinking = false;
+            self.mid_line = false;
+        }
+        print!("{t}");
+        self.mid_line = !t.ends_with('\n');
+        let _ = std::io::stdout().flush();
+    }
+    fn thinking(&mut self, t: &str) {
+        if !self.in_thinking {
+            self.newline();
+            print!("{DIM}");
+            self.in_thinking = true;
+        }
+        print!("{t}");
+        self.mid_line = !t.ends_with('\n');
+        let _ = std::io::stdout().flush();
+    }
+    fn tool(&mut self, name: &str, summary: &str, class: &Class) {
+        self.newline();
+        let tag = match class.state {
+            State::Read | State::Local => String::new(),
+            s => format!(" {YELLOW}[{s:?}]{OFF}"),
+        };
+        println!("{CYAN}●{OFF} {name}({summary}){tag}");
+    }
+    fn tool_done(&mut self, text: &str, is_error: bool) {
+        let lines: Vec<&str> = text.lines().collect();
+        let color = if is_error { RED } else { DIM };
+        for (i, l) in lines.iter().take(4).enumerate() {
+            let l: String = l.chars().take(160).collect();
+            println!("  {color}{}{l}{OFF}", if i == 0 { "⎿ " } else { "  " });
+        }
+        if lines.len() > 4 {
+            println!("  {DIM}  … +{} lines{OFF}", lines.len() - 4);
+        }
+    }
+    fn note(&mut self, t: &str) {
+        self.newline();
+        println!("{YELLOW}{t}{OFF}");
+    }
+    fn retry(&mut self, t: &str) {
+        self.newline();
+        println!("{DIM}{t}{OFF}");
+    }
+    fn usage(&mut self, u: &Value) {
+        self.tokens_in += u["input_tokens"].as_u64().unwrap_or(0) + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        self.tokens_cached += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        self.tokens_out += u["output_tokens"].as_u64().unwrap_or(0);
+    }
+    fn ask(&mut self, q: &str) -> bool {
+        self.newline();
+        print!("{YELLOW}{q} [y/N] {OFF}");
+        let _ = std::io::stdout().flush();
+        let mut s = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut s);
+        matches!(s.trim(), "y" | "Y" | "yes")
+    }
+}
+
+pub struct Opts {
+    pub model: String,
+    pub effort: Option<String>,
+    pub mode: Permission,
+    pub show_thinking: bool,
+    pub resume: bool,
+    pub max_steps: usize,
+}
+
+/// Pick or create the branch: an explicit name, the latest one (--resume), or a fresh session.
+fn open_session<'a>(eng: &'a Engine, branch: Option<&str>, o: &Opts) -> Result<Session<'a>> {
+    let name = match branch {
+        Some(b) => eng.branch(b),
+        None if o.resume => eng.latest_branch()?.context("no session to resume in this worktree")?,
+        None => eng.branch(&format!("s/{}", runestone::store::now() as u64)),
+    };
+    let has_session = match eng.store.head(&name)? {
+        Some(h) => agent::fold::spawn_config(&effective_chain(&eng.store, &h)?).is_some(),
+        None => false,
+    };
+    if !has_session {
+        let cfg = Config {
+            model: o.model.clone(),
+            effort: o.effort.clone(),
+            thinking_display: o.show_thinking.then(|| "summarized".to_string()),
+            ..Config::default()
+        };
+        Session::spawn(eng, &name, &cfg, &today())?;
+    }
+    Ok(Session {
+        eng,
+        branch: name,
+        provider: Box::new(Anthropic::from_env()?),
+        ui: Box::new(StdUi::default()),
+        perm: o.mode,
+        max_steps: o.max_steps,
+    })
+}
+
+pub fn run_once(eng: &Engine, branch: Option<&str>, o: &Opts, prompt: &str) -> Result<()> {
+    let mut s = open_session(eng, branch, o)?;
+    let r = s.turn(prompt)?;
+    println!();
+    eprintln!("{DIM}[{} · {} steps · {}]{OFF}", short_branch(&s.branch), r.steps, r.stop);
+    Ok(())
+}
+
+pub fn chat(eng: &Engine, branch: Option<&str>, o: &Opts) -> Result<()> {
+    let mut s = open_session(eng, branch, o)?;
+    eprintln!(
+        "{DIM}rune · {} · {} · /help for commands{OFF}",
+        short_branch(&s.branch),
+        eng.world.worktree.display()
+    );
+    let stdin = std::io::stdin();
+    loop {
+        print!("\n› ");
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        loop {
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                return Ok(());
+            }
+            let l = line.trim_end_matches('\n');
+            if let Some(stripped) = l.strip_suffix('\\') {
+                input.push_str(stripped);
+                input.push('\n');
+                print!("  ");
+                std::io::stdout().flush()?;
+            } else {
+                input.push_str(l);
+                break;
+            }
+        }
+        let input = input.trim();
+        if input.is_empty() {
+            continue;
+        }
+        if let Some(cmd) = input.strip_prefix('/') {
+            match slash(&mut s, cmd) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {}
+                Err(e) => eprintln!("{RED}{e:#}{OFF}"),
+            }
+            continue;
+        }
+        match s.turn(input) {
+            Ok(_) => {}
+            Err(e) => eprintln!("\n{RED}{e:#}{OFF}\n{DIM}(the record is intact; /continue retries){OFF}"),
+        }
+        println!();
+    }
+}
+
+/// Returns true to exit.
+fn slash(s: &mut Session, cmd: &str) -> Result<bool> {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let eng = s.eng;
+    match parts.first().copied().unwrap_or("") {
+        "exit" | "quit" | "q" => return Ok(true),
+        "help" => println!(
+            "/log [n]            recent events\n/rewind N [hard]    restore conversation and files to the end of turn N\n/undo               undo the last rewind\n/fork N DIR         copy the world at turn N into DIR as a new branch\n/continue           resume the loop from the current head\n/verify             re-render every request from the record and compare\n/exit"
+        ),
+        "log" => {
+            let n: usize = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(15);
+            for ev in eng.lineage(&s.branch)?.iter().rev().take(n) {
+                println!("  {}", ops::describe(ev));
+            }
+        }
+        "rewind" => {
+            let n: u64 = parts.get(1).and_then(|x| x.parse().ok()).context("usage: /rewind N [hard]")?;
+            let mode = if parts.get(2) == Some(&"hard") { Mode::Hard } else { Mode::KeepHuman };
+            let chain = s.chain()?;
+            let target = chain
+                .iter()
+                .rev()
+                .find(|e| e.turn() == Some(n) && e.kind == "turn.end")
+                .or_else(|| chain.iter().rev().find(|e| e.turn() == Some(n)))
+                .cloned()
+                .with_context(|| format!("no turn {n} in this conversation"))?;
+            let plan = rewind::plan(eng, &s.branch, &target, mode)?;
+            print!("{}", plan.render());
+            if !s.ui.ask("Apply this rewind?") {
+                return Ok(false);
+            }
+            let ext = !plan.external.is_empty() && s.ui.ask("Some actions stay live in the outside world. Continue anyway?");
+            let ev = rewind::apply(eng, &plan, ext)?;
+            s.ui.note(ev.str("note").unwrap_or("rewound"));
+        }
+        "undo" => {
+            let ev = rewind::undo(eng, &s.branch)?;
+            s.ui.note(ev.str("note").unwrap_or("undone"));
+        }
+        "fork" => {
+            let n: u64 = parts.get(1).and_then(|x| x.parse().ok()).context("usage: /fork N DIR")?;
+            let dir = PathBuf::from(parts.get(2).context("usage: /fork N DIR")?);
+            let chain = s.chain()?;
+            let at = chain.iter().rev().find(|e| e.turn() == Some(n) && e.kind == "turn.end").cloned().context("no such turn")?;
+            let (b, _) = ops::fork(eng, &at, &format!("s/fork-{}", runestone::store::now() as u64), &dir)?;
+            println!("forked into {} as {}. Continue there with: rune -C {} chat -b {}", dir.display(), b, dir.display(), short_branch(&b));
+        }
+        "continue" => {
+            s.run_loop()?;
+            println!();
+        }
+        "verify" => {
+            let r = agent::verify_requests(eng, &s.branch)?;
+            let bad = r.iter().filter(|x| !x.1).count();
+            println!("{} requests re-rendered, {} mismatched", r.len(), bad);
+        }
+        other => println!("unknown command /{other}; /help"),
+    }
+    Ok(false)
+}
+
+/// Print the conversation exactly as the model would see it next.
+pub fn transcript(eng: &Engine, branch: &str, json: bool) -> Result<()> {
+    let head = eng.store.head(branch)?.context("no such branch")?;
+    let chain = effective_chain(&eng.store, &head)?;
+    let f = fold(&eng.store, &chain)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&f.messages)?);
+        return Ok(());
+    }
+    for m in &f.messages {
+        let role = m["role"].as_str().unwrap_or("");
+        for b in m["content"].as_array().into_iter().flatten() {
+            let line = match b["type"].as_str().unwrap_or("") {
+                "text" => b["text"].as_str().unwrap_or("").to_string(),
+                "thinking" => format!("{DIM}(thinking){OFF}"),
+                "tool_use" => format!("{CYAN}{}{OFF} {}", b["name"].as_str().unwrap_or(""), b["input"]),
+                "tool_result" => {
+                    let c = b["content"].as_str().unwrap_or("");
+                    format!("{DIM}⎿ {}{OFF}", c.lines().next().unwrap_or(""))
+                }
+                t => format!("({t})"),
+            };
+            println!("{role:>9}: {line}");
+        }
+    }
+    Ok(())
+}
+
+pub fn short_branch(b: &str) -> &str {
+    b.split_once('/').map(|x| x.1).unwrap_or(b)
+}
+
+/// Today's date (UTC) without a date crate.
+pub fn today() -> String {
+    let days = (runestone::store::now() / 86_400.0) as i64;
+    // civil-from-days (Howard Hinnant)
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02}")
+}

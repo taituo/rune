@@ -67,9 +67,19 @@ impl Engine {
             if kind == "turn.start" {
                 turn += 1;
             }
+            // A caller may pin the turn (a rewind continues from the target's turn).
+            if let Some(t) = extra.get("turn").and_then(Value::as_u64) {
+                turn = t;
+            }
             let mut body = Map::new();
             if let Value::Object(m) = &extra {
                 body.extend(m.clone());
+            }
+            if kind == "turn.start" && author == "outside" && !body.contains_key("note") {
+                // Stored, not recomputed: what the model saw must not change when the template does.
+                if let Some(n) = outside_note_text(&changed, turn) {
+                    body.insert("note".into(), json!(n));
+                }
             }
             body.insert("tree".into(), json!(tree));
             body.insert("turn".into(), json!(turn));
@@ -90,24 +100,7 @@ impl Engine {
     /// The note injected at turn start: outside changes since the agent's last turn. Paths and counts
     /// only, never content (hook output carries the harness's authority).
     pub fn outside_note(&self, ev: &Event) -> Option<String> {
-        if ev.str("author") != Some("outside") {
-            return None;
-        }
-        let changes = changes(ev);
-        if changes.is_empty() {
-            return None;
-        }
-        let last = ev.turn().unwrap_or(1).saturating_sub(1);
-        let listed: Vec<String> = changes
-            .iter()
-            .take(10)
-            .map(|c| format!("{} {} ({})", c.status, c.path, c.stat()))
-            .collect();
-        let more = if changes.len() > 10 { format!("\n  …and {} more", changes.len() - 10) } else { String::new() };
-        Some(format!(
-            "Since your last turn (turn {last}), outside changes in this worktree:\n  {}{more}\nNot made by you. Read them before editing these files.",
-            listed.join("   ")
-        ))
+        ev.str("note").map(str::to_string)
     }
 
     /// Per-path history on a branch, newest first: (event, change).
@@ -120,6 +113,19 @@ impl Engine {
         }
         Ok(out)
     }
+}
+
+fn outside_note_text(changes: &[Change], turn: u64) -> Option<String> {
+    if changes.is_empty() {
+        return None;
+    }
+    let last = turn.saturating_sub(1);
+    let listed: Vec<String> = changes.iter().take(10).map(|c| format!("{} {} ({})", c.status, c.path, c.stat())).collect();
+    let more = if changes.len() > 10 { format!("\n  …and {} more", changes.len() - 10) } else { String::new() };
+    Some(format!(
+        "[harness event, not from the user] Since your last turn (turn {last}), outside changes in this worktree:\n  {}{more}\nNot made by you. Read them before editing these files.",
+        listed.join("   ")
+    ))
 }
 
 pub fn changes(ev: &Event) -> Vec<Change> {
