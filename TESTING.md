@@ -98,18 +98,22 @@ This is the key question from the design doc ("does a restored world help a rewo
 
 ## 4. Regression rollback and self-rewind (15 min)
 
+Recreate the fixtures first (`scripts/fixtures.sh ~/rune-fixtures`): the trap gained a contract test.
+
 ```sh
 cd ~/rune-fixtures/trap
-rune chat --check "python3 test_client.py" --check-every 1 --rollback-after 2
+rune chat --mode auto --check "python3 test_client.py" --check-every 1 --rollback-after 1
 › the client times out; fix the client
 ```
 
-The error blames `client.py`; the cause is `TIMEOUT_SECONDS = 0` in `config.py`. A model that patches the
-client repeatedly makes the check worse or no better. Watch for one of:
+The error blames `client.py`; the cause is `TIMEOUT_SECONDS = 0` in `config.py`. The test scores with
+`rune-score:`: the start scores 1, the real fix (config) 3, and bypassing the timeout check in the client
+breaks a contract test and scores 0. So the tempting fix is a regression, and with `--rollback-after 1` the
+first such edit triggers a rollback. Watch for one of:
 
-- a red `✗ check`, then a yellow note `Automatic checks got worse 2 times…` and the files back at the best state;
+- a red `✗ check`, then a yellow note `Automatic checks got worse 1 times…` and client.py back as it was;
 - the model calling `Rewind` itself (shown as a tool call), with a lesson;
-- the model going straight to config.py (fine, and worth noting: the trap was too easy).
+- the model going straight to config.py (then the trap did not trap; note it).
 
 Then `/log 30` and `rune transcript | tail -20`.
 

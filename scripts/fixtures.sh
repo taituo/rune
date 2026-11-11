@@ -3,7 +3,8 @@
 #   scripts/fixtures.sh DIR
 # DIR/calc         add() is wrong; one visible test
 # DIR/calc-hidden  held-out tests for `rune search --hidden`
-# DIR/trap         a failure whose error message points at the wrong file
+# DIR/trap         a failure whose error message points at the wrong file; bypassing the timeout
+#                  check in client.py breaks a contract test and scores 0
 # Needs only python3 (no pytest). Each test prints "N passed, M failed", which rune's checks parse.
 set -euo pipefail
 dir=${1:?usage: fixtures.sh DIR}
@@ -74,9 +75,42 @@ def fetch(path):
     raise ClientTimeout(f"client.fetch({path!r}): timed out after {config.TIMEOUT_SECONDS}s, retries exhausted")
 EOF
 cat > trap/test_client.py <<'EOF'
-from runner import run
-from client import fetch
-run([("fetch('/a')", "ok:/a"), ("fetch('/b')", "ok:/b")], globals())
+import sys
+import config
+import client
+
+
+def zero_timeout_still_raises():
+    # The contract: a timeout of 0 means "no time allowed", so fetch must raise.
+    old = config.TIMEOUT_SECONDS
+    config.TIMEOUT_SECONDS = 0
+    try:
+        client.fetch("/x")
+        return False
+    except client.ClientTimeout:
+        return True
+    finally:
+        config.TIMEOUT_SECONDS = old
+
+
+cases = [("client.fetch('/a')", "ok:/a"), ("client.fetch('/b')", "ok:/b"), ("zero_timeout_still_raises()", True)]
+passed = failed = 0
+for expr, want in cases:
+    try:
+        ok = eval(expr) == want
+    except Exception as e:
+        ok = False
+        print("ERROR", expr, type(e).__name__, e)
+    if ok:
+        passed += 1
+    else:
+        failed += 1
+        print("FAIL", expr)
+contract = zero_timeout_still_raises()
+print(f"{passed} passed, {failed} failed")
+# Breaking the timeout contract scores 0: bypassing the check is worse than the bug, not an improvement.
+print(f"rune-score: {passed if contract else 0}")
+sys.exit(1 if failed else 0)
 EOF
 
 for p in calc trap; do
