@@ -197,7 +197,7 @@ impl World {
 
     /// `tree` with each of `paths` taken from `from` (or removed if absent there).
     pub fn take_paths(&self, tree: &str, from: &str, paths: &[String]) -> Result<String> {
-        let tmp = self.git_dir.join(format!("index.take.{}", std::process::id()));
+        let tmp = self.git_dir.join(format!("index.take.{}.{}", std::process::id(), next_seq()));
         let _guard = Cleanup(tmp.clone());
         self.git_idx(&tmp, &self.worktree, &["read-tree", tree])?;
         for p in paths {
@@ -266,12 +266,18 @@ impl World {
     /// Write `tree` into a fresh directory (a fork's world).
     pub fn materialize(&self, tree: &str, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
-        let tmp = self.git_dir.join(format!("index.mat.{}.{}", std::process::id(), crate::store::now() as u64));
+        // Unique per call: parallel attempts materialize at the same time.
+        let tmp = self.git_dir.join(format!("index.mat.{}.{}", std::process::id(), next_seq()));
         let _guard = Cleanup(tmp.clone());
         self.git_idx(&tmp, dir, &["read-tree", tree])?;
         self.git_idx(&tmp, dir, &["checkout-index", "-a", "-f"])?;
         Ok(())
     }
+}
+
+fn next_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 struct Cleanup(PathBuf);
