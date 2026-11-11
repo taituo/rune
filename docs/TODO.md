@@ -34,7 +34,7 @@ design notes doc ("rune: design notes, deep pass").
 - [x] Offline runs (checks, dry-mode Bash) keep loopback up, so mock-server tests pass offline (found by
       --validate: two of rune's own tasks failed at their commit because 127.0.0.1 was down).
 - [x] Concurrent `Store::open` no longer fails with "database is locked" (opens take turns on a lock file).
-- [ ] Shared build cache for Rust tasks (each cell compiles from scratch: ~35 s for rune).
+- [x] Shared cargo target dir for eval cells and validations (`$RUNE_HOME/cache/cargo-target`, unless CARGO_TARGET_DIR is set).
 - [ ] Spread over runs per cell in the report; per-task links into the record (branch ids are in report.json).
 - [ ] M2.5 experiments as eval variants (restored world vs conversation-only rewind, planted lesson, elision).
 

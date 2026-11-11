@@ -94,11 +94,13 @@ processes; object store for trees. Only when M2 shows search or gym runs are wor
 
 ## What I do next, without waiting
 
-1. **M1.2 incremental fold** (half done in design; measured 55 ms/step at 1000 steps).
-2. **M1.1 Ctrl-C** and **M1.6 index lock**, the two robustness gaps most likely to hit you in T1/T2.
-3. **M1.4 gateway quirks** as soon as T1 reports any.
-4. **M1.8 `rune doctor`**.
-5. Then M2.1–M2.3, so T9 stops being manual.
+Done: M1.1 Ctrl-C, M1.2 incremental fold, M1.4 gateway quirks, M1.6 per-worktree lock, M1.7 symlink-safe
+writes, M1.8 `rune doctor`, M2.1–M2.4 `rune eval` (mine with `--validate`, run, report).
+
+1. **Shared build cache for eval cells** (each Rust cell compiles from scratch, ~35 s), then a first real
+   `rune eval run` with Muse over rune's own validated tasks: plain vs checks vs rollback vs search.
+2. **M2.5** experiments as eval variants.
+3. **M3.1** in-process scan world (stat cache), the biggest per-step cost left in interactive sessions.
 
 I push each item to `main` with its tests and a line in TODO.md; anything that changes behaviour you test gets a
 note in TESTING.md.

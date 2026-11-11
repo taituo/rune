@@ -293,6 +293,11 @@ fn task_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 
 fn eval_cmd(cmd: &EvalCmd) -> Result<()> {
     use runestone::eval;
+    // Cells and validations build the same project over and over: share one cargo target dir so
+    // dependencies compile once (set before any thread starts; inherited by every check and Bash call).
+    if std::env::var_os("CARGO_TARGET_DIR").is_none() && !matches!(cmd, EvalCmd::Report { .. }) {
+        std::env::set_var("CARGO_TARGET_DIR", runestone::engine::rune_home().join("cache/cargo-target"));
+    }
     match cmd {
         EvalCmd::Mine { repo, out, limit, max_code_lines, validate, jobs } => {
             let mut tasks = eval::mine(repo, &eval::MineOpts { limit: *limit, max_code_lines: *max_code_lines })?;
