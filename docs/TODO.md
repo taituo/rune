@@ -61,8 +61,10 @@ design notes doc ("rune: design notes, deep pass").
 
 - [x] Fork Bash commands run in their own mount namespace with the fork bind-mounted over the main worktree
       path, so indirect paths (env vars, paths read from files) land in the fork. Tested.
-- [ ] File tools (Read/Write/Edit) still map paths by prefix; a symlink in the tree pointing at the absolute main
-      path would be followed to the live tree.
+- [x] Write/Edit follow symlinks before deciding inside/outside: a fork refuses writes that lead out, dry mode
+      blocks them, ask mode asks (M1.7).
+- [x] Gateway quirks: calls all at index 0, arguments as an object, "stop"/no finish_reason next to calls,
+      missing or reused tool-call ids (renamed to stay unique in the conversation). One mock test each (M1.4).
 - [ ] Per-hunk parking instead of whole-file parking on conflict.
 - [ ] Rewind plan reports excluded paths that changed (cannot be restored).
 - [x] Two sessions in one worktree share the shadow index: per-worktree flock around init, snapshot, checkout (M1.6).

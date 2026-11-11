@@ -101,6 +101,32 @@ pub struct Ctx {
     pub alias: Option<PathBuf>,
 }
 
+/// Where a write to `p` would land: the deepest existing ancestor canonicalized, the rest appended. A dangling
+/// symlink on the way is followed by hand (canonicalize refuses it).
+fn real_path(p: &Path, depth: u32) -> PathBuf {
+    let mut cur = p.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(c) = std::fs::canonicalize(&cur) {
+            return tail.iter().rev().fold(c, |acc, t| acc.join(t));
+        }
+        if depth < 16 {
+            if let Ok(target) = std::fs::read_link(&cur) {
+                let base = cur.parent().map(Path::to_path_buf).unwrap_or_default();
+                let next = tail.iter().rev().fold(normalize(&base.join(target)), |acc, t| acc.join(t));
+                return real_path(&next, depth + 1);
+            }
+        }
+        match (cur.file_name().map(|n| n.to_os_string()), cur.parent()) {
+            (Some(n), Some(parent)) => {
+                tail.push(n);
+                cur = parent.to_path_buf();
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
 /// Can we run commands in an unprivileged user + network namespace on this machine?
 pub fn offline_available() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -158,8 +184,11 @@ impl Ctx {
         }
     }
 
+    /// Is `p` inside the worktree once symlinks are followed? A link to /tmp, or (in a fork) to the main
+    /// worktree, is outside even though its own path is inside.
     pub fn inside(&self, p: &Path) -> bool {
-        p.starts_with(&self.worktree)
+        let root = std::fs::canonicalize(&self.worktree).unwrap_or_else(|_| self.worktree.clone());
+        real_path(p, 0).starts_with(&root)
     }
 
     pub fn run(&self, name: &str, input: &Value) -> Outcome {

@@ -200,3 +200,78 @@ fn agent_loop_through_a_gateway_is_exact() {
     assert_eq!(stored, bodies);
     assert!(verify_requests(&eng, &b).unwrap().iter().all(|x| x.1));
 }
+
+fn send_one(chunks: &[Value]) -> Value {
+    let (port, h) = serve(vec![sse(chunks)]);
+    let m = OpenAi::new(&format!("http://127.0.0.1:{port}"), None, false).send(b"{}", &mut |_| {}).unwrap();
+    h.join().unwrap();
+    m
+}
+
+#[test]
+fn quirk_every_call_at_index_zero() {
+    // Told apart only by id.
+    let m = send_one(&[
+        json!({ "id": "c", "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "a", "function": { "name": "Read", "arguments": "{\"file_path\":\"x\"}" } }] } }] }),
+        json!({ "id": "c", "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "b", "function": { "name": "Glob", "arguments": "{\"pattern\":\"*\"}" } }] } }] }),
+        json!({ "id": "c", "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }] }),
+    ]);
+    let c = m["content"].as_array().unwrap();
+    assert_eq!(c.len(), 2);
+    assert_eq!((c[0]["id"].as_str(), c[0]["name"].as_str()), (Some("a"), Some("Read")));
+    assert_eq!((c[1]["id"].as_str(), c[1]["input"].clone()), (Some("b"), json!({ "pattern": "*" })));
+}
+
+#[test]
+fn quirk_arguments_as_an_object() {
+    let m = send_one(&[json!({ "id": "c", "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "id": "a", "function": { "name": "Read", "arguments": { "file_path": "x" } } }] }, "finish_reason": "tool_calls" }] })]);
+    assert_eq!(m["content"][0]["input"], json!({ "file_path": "x" }));
+}
+
+#[test]
+fn quirk_stop_or_no_finish_reason_next_to_calls() {
+    for finish in [json!("stop"), Value::Null] {
+        let m = send_one(&[json!({ "id": "c", "choices": [{ "index": 0, "delta": { "content": "", "tool_calls": [{ "index": 0, "id": "a", "function": { "name": "Glob", "arguments": "{}" } }] }, "finish_reason": finish }] })]);
+        assert_eq!(m["stop_reason"], "tool_use");
+        assert_eq!(m["content"].as_array().unwrap().len(), 1, "empty content adds no text block");
+    }
+}
+
+#[test]
+fn quirk_missing_and_reused_ids_stay_unique_in_the_conversation() {
+    // A gateway that never sends ids, two turns in a row: both calls would be call_0.
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    std::fs::write(wt.path().join("a.py"), "x = 1\n").unwrap();
+    let eng = Engine::open_in(home.path(), wt.path()).unwrap();
+    let b = eng.branch("s/ids");
+    let cfg = Config { api: "openai".into(), model: "m".into(), ..Config::default() };
+    Session::spawn(&eng, &b, &cfg, "2026-11-12").unwrap();
+    let call = |args: &str| sse(&[json!({ "id": "r", "choices": [{ "index": 0, "delta": { "tool_calls": [{ "index": 0, "function": { "name": "Read", "arguments": args } }] }, "finish_reason": "tool_calls" }] })]);
+    let done = sse(&[json!({ "id": "r", "choices": [{ "index": 0, "delta": { "content": "ok" }, "finish_reason": "stop" }] })]);
+    let (port, h) = serve(vec![call("{\"file_path\":\"a.py\"}"), call("{\"file_path\":\"a.py\"}"), done]);
+    let mut s = Session {
+        eng: &eng,
+        branch: b.clone(),
+        provider: Box::new(OpenAi::new(&format!("http://127.0.0.1:{port}"), None, false)),
+        ui: Box::new(Quiet),
+        perm: Permission::Dry,
+        max_steps: 10,
+        checks: None,
+    };
+    assert_eq!(s.turn("read it twice").unwrap().text, "ok");
+    let bodies = h.join().unwrap();
+    let last: Value = serde_json::from_slice(&bodies[2]).unwrap();
+    let ids: Vec<&str> = last["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|m| m["tool_calls"].as_array().into_iter().flatten())
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    assert_ne!(ids[0], ids[1]);
+    let results: Vec<&str> = last["messages"].as_array().unwrap().iter().filter(|m| m["role"] == "tool").map(|m| m["tool_call_id"].as_str().unwrap()).collect();
+    assert_eq!(results, ids, "each result answers its own call");
+    assert!(verify_requests(&eng, &b).unwrap().iter().all(|x| x.1));
+}

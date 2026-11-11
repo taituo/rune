@@ -228,12 +228,18 @@ fn from_message(v: &Value, on: &mut dyn FnMut(Delta)) -> Result<Value> {
     }
     for (i, c) in m["tool_calls"].as_array().into_iter().flatten().enumerate() {
         let name = c["function"]["name"].as_str().unwrap_or("");
-        let id = c["id"].as_str().map(str::to_string).unwrap_or_else(|| format!("call_{i}"));
-        content.push(json!({ "type": "tool_use", "id": id, "name": name, "input": parse_args(name, c["function"]["arguments"].as_str().unwrap_or("")) }));
+        let id = c["id"].as_str().filter(|s| !s.is_empty()).map(str::to_string).unwrap_or_else(|| format!("call_{i}"));
+        let args = match &c["function"]["arguments"] {
+            Value::String(a) => a.clone(),
+            Value::Null => String::new(),
+            v => v.to_string(),
+        };
+        content.push(json!({ "type": "tool_use", "id": id, "name": name, "input": parse_args(name, &args) }));
     }
+    let has_calls = content.iter().any(|b| b["type"] == "tool_use");
     Ok(json!({
         "id": v["id"], "model": v["model"], "type": "message", "role": "assistant", "content": content,
-        "stop_reason": stop_reason(choice["finish_reason"].as_str().unwrap_or("stop")),
+        "stop_reason": if has_calls { "tool_use" } else { stop_reason(choice["finish_reason"].as_str().unwrap_or("stop")) },
         "usage": usage(&v["usage"]),
     }))
 }
@@ -251,6 +257,8 @@ struct Acc {
     model: Value,
     text: String,
     calls: std::collections::BTreeMap<u64, Call>,
+    /// Stream index → slot in `calls`. Some gateways send every call at index 0, told apart only by id.
+    slots: std::collections::HashMap<u64, u64>,
     finish: Option<String>,
     usage: Value,
     seen_any: bool,
@@ -278,9 +286,19 @@ impl Acc {
             self.text.push_str(t);
         }
         for c in d["tool_calls"].as_array().into_iter().flatten() {
-            let idx = c["index"].as_u64().unwrap_or(self.calls.len() as u64);
-            let entry = self.calls.entry(idx).or_default();
-            if let Some(id) = c["id"].as_str() {
+            let next = self.calls.len() as u64;
+            let idx = c["index"].as_u64().unwrap_or(next);
+            let mut slot = *self.slots.entry(idx).or_insert(next);
+            let id = c["id"].as_str().filter(|s| !s.is_empty());
+            if let (Some(id), Some(prev)) = (id, self.calls.get(&slot)) {
+                if !prev.id.is_empty() && prev.id != id {
+                    // Same index, new id: a new call, not more of the old one.
+                    slot = self.calls.keys().max().map_or(0, |m| m + 1);
+                    self.slots.insert(idx, slot);
+                }
+            }
+            let entry = self.calls.entry(slot).or_default();
+            if let Some(id) = id {
                 entry.id = id.to_string();
             }
             if let Some(n) = c["function"]["name"].as_str() {
@@ -289,8 +307,10 @@ impl Acc {
                 }
                 entry.name.push_str(n);
             }
-            if let Some(a) = c["function"]["arguments"].as_str() {
-                entry.args.push_str(a);
+            match &c["function"]["arguments"] {
+                Value::String(a) => entry.args.push_str(a),
+                Value::Null => {}
+                v => entry.args = v.to_string(), // an object instead of a JSON string
             }
         }
         if let Some(f) = choice["finish_reason"].as_str() {
@@ -310,7 +330,8 @@ impl Acc {
             let id = if c.id.is_empty() { format!("call_{i}") } else { c.id.clone() };
             content.push(json!({ "type": "tool_use", "id": id, "name": c.name, "input": parse_args(&c.name, &c.args) }));
         }
-        let finish = self.finish.unwrap_or_else(|| if self.calls.is_empty() { "stop".into() } else { "tool_calls".into() });
+        // Tool calls decide it: some gateways say "stop" (or nothing) next to calls.
+        let finish = if self.calls.is_empty() { self.finish.unwrap_or_else(|| "stop".into()) } else { "tool_calls".into() };
         let mut m = Map::new();
         m.insert("id".into(), self.id);
         m.insert("model".into(), self.model);

@@ -306,3 +306,45 @@ fn interrupt_kills_the_running_command_and_keeps_the_record_valid() {
     assert!(results[1].1 && results[1].0.contains("Not run"), "{:?}", results[1]);
     assert!(verify_requests(&eng, &s.branch).unwrap().iter().all(|x| x.1));
 }
+
+#[test]
+fn writes_through_symlinks_that_leave_the_worktree_are_gated() {
+    let (_h, wt, eng) = setup();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), wt.path().join("out")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("new.txt"), wt.path().join("dangling")).unwrap();
+    let script = Rc::new(Scripted::new(vec![
+        msg(vec![
+            tool_use("a", "Write", json!({ "file_path": "out/x.txt", "content": "x" })),
+            tool_use("b", "Write", json!({ "file_path": "dangling", "content": "y" })),
+            tool_use("c", "Write", json!({ "file_path": "in.txt", "content": "z" })),
+        ]),
+        msg(vec![text("done")]),
+    ]));
+    let mut s = session(&eng, &script, Permission::Dry);
+    s.turn("write three files").unwrap();
+    let res = all_results(&request(&script, 1));
+    assert!(res[0].1 && res[0].0.starts_with("Blocked"), "{:?}", res[0]);
+    assert!(res[1].1 && res[1].0.starts_with("Blocked"), "{:?}", res[1]);
+    assert!(!res[2].1, "{:?}", res[2]);
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0, "nothing landed outside");
+    assert_eq!(fs::read_to_string(wt.path().join("in.txt")).unwrap(), "z");
+}
+
+#[test]
+fn a_fork_link_to_the_main_worktree_is_outside_the_fork() {
+    let main = tempfile::tempdir().unwrap();
+    let fork = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(main.path(), fork.path().join("back")).unwrap();
+    let ctx = runestone::agent::tools::Ctx {
+        worktree: fork.path().to_path_buf(),
+        tmp: fork.path().join(".tmp"),
+        seen: Default::default(),
+        offline: false,
+        alias: Some(main.path().to_path_buf()),
+    };
+    // The main path itself maps into the fork; a link that leads back to it does not.
+    assert!(ctx.inside(&ctx.resolve(&main.path().join("a.txt").to_string_lossy())));
+    assert!(ctx.inside(&ctx.resolve("a.txt")));
+    assert!(!ctx.inside(&ctx.resolve("back/a.txt")));
+}

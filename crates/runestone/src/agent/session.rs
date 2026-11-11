@@ -295,7 +295,8 @@ impl<'a> Session<'a> {
             };
             self.ui.usage(&resp["usage"]);
             usage.add(&resp["usage"]);
-            let content = resp["content"].clone();
+            let mut content = resp["content"].clone();
+            unique_ids(&mut content, &req, &req_hash);
             let text: String = content
                 .as_array()
                 .into_iter()
@@ -375,13 +376,34 @@ impl<'a> Session<'a> {
     fn call_tool(&mut self, ctx: &mut tools::Ctx, id: &str, name: &str, input: &Value) -> Result<bool> {
         let sum = summary(name, input);
         let mut class = classify::tool(name, input);
+        let mut outside = false;
         if matches!(name, "Write" | "Edit") {
             if let Some(p) = input["file_path"].as_str() {
                 if !ctx.inside(&ctx.resolve(p)) {
+                    outside = true;
                     class = Class { state: State::LocalOutside, disclosure: class.disclosure, reason: format!("{name} outside the worktree") };
                 }
             }
         }
+        // A write that lands outside the worktree (directly or through a symlink) is not recorded, so no
+        // rewind can undo it. A fork never may; a dry session may not; ask mode asks.
+        let refused = if !outside {
+            None
+        } else if ctx.alias.is_some() {
+            Some("This is a fork: writes outside it are refused (the path, or a symlink on it, leads out).".to_string())
+        } else {
+            match self.perm {
+                Permission::Auto => None,
+                Permission::Dry => Some("Blocked: the path, or a symlink on it, leads outside the worktree, where rune cannot rewind it. Write inside the worktree.".into()),
+                Permission::Ask => {
+                    if self.ui.ask(&format!("Allow {name} `{sum}`? It lands outside the worktree; rune cannot rewind it.")) {
+                        None
+                    } else {
+                        Some(format!("The user declined `{sum}`. Do not retry it; continue without it or ask the user."))
+                    }
+                }
+            }
+        };
         if input.get("__unparsed").is_some() {
             let msg = "The tool input was not valid JSON (the response may have hit max_tokens). Retry with a smaller call.";
             self.eng.record(&self.branch, "tool.post", json!({ "call": id, "tool": name, "summary": sum, "result": msg, "is_error": true }))?;
@@ -390,7 +412,9 @@ impl<'a> Session<'a> {
         // Dry world: known outside-world actions are blocked; commands we cannot classify run with no
         // network, so they can change the workspace but cannot reach anything outside it.
         let mut offline = false;
-        let blocked = if class.gated() {
+        let blocked = if refused.is_some() {
+            refused
+        } else if class.gated() {
             match self.perm {
                 Permission::Auto => None,
                 Permission::Dry if class.state == State::Unknown && name == "Bash" && tools::offline_available() => {
@@ -628,5 +652,23 @@ impl<'a> Session<'a> {
         )?;
         self.ui.note(&note);
         Ok(None)
+    }
+}
+
+/// Tool-call ids must be unique in the conversation, or results attach to the wrong call. Gateways that
+/// omit ids (we name them call_0, call_1, …) or reuse them across turns break that, so rename any id that
+/// is empty, repeated within the message, or already in the request. Deterministic: same request, same ids.
+pub(crate) fn unique_ids(content: &mut Value, req: &[u8], req_hash: &str) {
+    let mut used = std::collections::HashSet::new();
+    for (i, b) in content.as_array_mut().into_iter().flatten().enumerate() {
+        if b["type"] != "tool_use" {
+            continue;
+        }
+        let id = b["id"].as_str().unwrap_or("").to_string();
+        let quoted = format!("\"{id}\"");
+        let clash = id.is_empty() || used.contains(&id) || req.windows(quoted.len()).any(|w| w == quoted.as_bytes());
+        let id = if clash { format!("{}_{}_{i}", if id.is_empty() { "call" } else { &id }, &req_hash[..8]) } else { id };
+        used.insert(id.clone());
+        b["id"] = json!(id);
     }
 }
