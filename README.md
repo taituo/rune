@@ -35,6 +35,30 @@ targets the last passing check.
 | Auto-rollback | After N consecutive checks worse than the best, a keep-human rewind to the best checked state, with the undone attempts listed for the model. At most 3 per request; never past an outside-world action. Abandoned branches stay in the record, and every recorded tree is pinned with a ref so git gc cannot collect them. |
 | Model | Anthropic Messages API, SSE streaming accumulated into the non-streaming shape, retries on 429/5xx/529 and stream errors. `--model`, `--effort`, `--show-thinking`. |
 
+## Branch search (experimental)
+
+```sh
+rune search --hyp "fix the arithmetic" --hyp "check whether the test is wrong" --hyp "rewrite it" \
+  --check "pytest -q" --hidden ../heldout --hidden-cmd "pytest -q heldout_test.py" "add() is wrong; fix it"
+```
+
+N attempts run in parallel from the current state, one per hypothesis (diversity is forced at the branch
+point), each in its own overlayfs fork and on its own branch of the record. Each is scored by the visible
+check and by held-out tests that are stacked over the attempt's layer only at evaluation time, so an attempt
+can neither read nor overwrite them. The best attempt (passes held-out, then highest scores, then smallest
+diff) is merged into the live worktree keep-human, and the session continues from its conversation. The
+others stay as `search/<id>/<i>` branches with their worlds pinned. Forks show the main worktree's path to
+the agent, so the winner's conversation stays valid after the fork directory is removed.
+
+Needs unprivileged user namespaces (`unshare`, overlayfs with `userxattr`); the CLI re-executes itself
+inside one. `--script DIR` runs scripted attempts (`attempt-<i>.json`) instead of a model.
+
+Measured (2-core VM, 20k-file tree, 10 steps per attempt): layered snapshots equal a full scan (tested,
+including deletions, replaced directories, ignored files, modes and symlinks); a fork mounts in 2–40 ms;
+but a step costs about as much as on the scan world (88–102 vs 111–115 ms with one attempt), because the
+cost is git subprocesses (~7 per event, `write-tree` most) and full-index rewrites, not the tree scan.
+Parallel attempts are CPU-bound: 16 attempts gave ~15 steps/s in aggregate vs ~9 for one.
+
 ## Versioned world
 
 ```
@@ -87,6 +111,10 @@ Without hooks you can drive it by hand: `rune record turn.start|tool.pre|tool.po
 - No daemon/JSON-RPC yet; the library API is the API.
 - No compaction yet (1M context); record-built compaction is next.
 - No Ctrl-C interrupt inside a turn; killing the process is safe (resume closes dangling calls).
+- Search forks map the main worktree's path in tool arguments, outputs and Bash command strings only; a
+  path built indirectly (env var, symlink, a script) can still reach the live tree. Real isolation needs a
+  per-attempt mount namespace that mounts the fork at the main path.
+- Per-event cost is dominated by git subprocesses; next step is in-process object and tree writing.
 
 ## Tests
 

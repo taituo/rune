@@ -84,6 +84,28 @@ enum Cmd {
     },
     /// Print the conversation exactly as the model will see it next
     Transcript,
+    /// Run N attempts in parallel from the current state, one per hypothesis, each in its own overlay
+    /// fork; pick the best by hidden tests, then visible ones, then smallest diff; merge it keep-human
+    Search {
+        #[command(flatten)]
+        a: AgentArgs,
+        /// One approach per attempt (repeat)
+        #[arg(long = "hyp", required = true)]
+        hypotheses: Vec<String>,
+        /// Directory of held-out test files, stacked over each attempt only at evaluation time
+        #[arg(long)]
+        hidden: Option<PathBuf>,
+        /// Command that runs the held-out tests
+        #[arg(long)]
+        hidden_cmd: Option<String>,
+        /// Scripted attempts instead of a model: DIR/attempt-<i>.json (for experiments)
+        #[arg(long)]
+        script: Option<PathBuf>,
+        /// Keep each attempt's overlay directories for inspection
+        #[arg(long)]
+        keep_dirs: bool,
+        prompt: Vec<String>,
+    },
     /// Ingest a harness hook event from stdin (fails open)
     Hook {
         #[arg(long, default_value = "claude")]
@@ -178,6 +200,23 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
+    // Overlay forks need an unprivileged user + mount namespace: re-run ourselves inside one.
+    if matches!(cli.cmd, Cmd::Search { .. }) && !runestone::layer::in_namespace() {
+        let exe = std::env::current_exe().expect("own path");
+        let status = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount"])
+            .arg(exe)
+            .args(std::env::args_os().skip(1))
+            .env("RUNE_NS", "1")
+            .status();
+        match status {
+            Ok(s) => std::process::exit(s.code().unwrap_or(1)),
+            Err(e) => {
+                eprintln!("rune: search needs `unshare` (util-linux) and unprivileged user namespaces: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Cmd::Hook { harness } = &cli.cmd {
         let mut raw = String::new();
         let _ = std::io::stdin().read_to_string(&mut raw);
@@ -247,6 +286,85 @@ fn run(cli: Cli) -> Result<()> {
                 prompt.join(" ")
             };
             return agent_cli::run_once(&eng, cli.branch.as_deref(), &opts(a, PermArg::Dry), p.trim());
+        }
+        Cmd::Search { a, hypotheses, hidden, hidden_cmd, script, keep_dirs, prompt } => {
+            let o = opts(a, PermArg::Dry);
+            let branch = match &cli.branch {
+                Some(b) => eng.branch(b),
+                None => eng.latest_branch()?.unwrap_or_else(|| eng.branch(&format!("s/{}", runestone::store::now() as u64))),
+            };
+            // Searching from a plain worktree is fine: start a session for it.
+            let has_session = match eng.store.head(&branch)? {
+                Some(h) => runestone::agent::fold::spawn_config(&runestone::agent::fold::effective_chain(&eng.store, &h)?).is_some(),
+                None => false,
+            };
+            if !has_session {
+                let cfg = runestone::agent::Config {
+                    model: a.model.clone(),
+                    effort: a.effort.clone(),
+                    thinking_display: a.show_thinking.then(|| "summarized".to_string()),
+                    ..Default::default()
+                };
+                runestone::agent::Session::spawn(&eng, &branch, &cfg, &agent_cli::today())?;
+            }
+            let visible = match &a.check {
+                Some(c) if c.is_empty() => None,
+                Some(c) => Some(c.clone()),
+                None => runestone::checks::detect(&eng.world.worktree),
+            };
+            let hidden = match (hidden, hidden_cmd) {
+                (Some(d), Some(c)) => Some(runestone::search::Hidden { dir: std::fs::canonicalize(d)?, cmd: c.clone() }),
+                (None, None) => None,
+                _ => bail!("--hidden and --hidden-cmd go together"),
+            };
+            let spec = runestone::search::Spec {
+                prompt: prompt.join(" "),
+                hypotheses: hypotheses.clone(),
+                visible,
+                hidden,
+                max_steps: o.max_steps,
+                perm: o.mode,
+                timeout: std::time::Duration::from_secs(600),
+                keep_dirs: *keep_dirs,
+            };
+            let script = script.clone();
+            let factory = move |i: usize| -> Box<dyn runestone::agent::model::Provider> {
+                match &script {
+                    Some(dir) => Box::new(
+                        runestone::agent::model::Scripted::from_file(&dir.join(format!("attempt-{i}.json"))).expect("script file"),
+                    ),
+                    None => Box::new(runestone::agent::model::Anthropic::from_env().expect("ANTHROPIC_API_KEY")),
+                }
+            };
+            let r = runestone::search::run(&eng, &branch, &spec, &factory)?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&r)?);
+                return Ok(());
+            }
+            println!("search {} from {} ({} attempts, base ready in {} ms, total {} ms)", r.id, &r.start[..12], r.outcomes.len(), r.base_ms, r.total_ms);
+            let sc = |s: &Option<runestone::checks::Score>| match s {
+                Some(s) => format!("{}{}/{}", if s.green { "✓" } else { "✗" }, s.passed, s.passed + s.failed),
+                None => "-".into(),
+            };
+            for o in &r.outcomes {
+                let mark = if Some(o.index) == r.winner { "★" } else { " " };
+                println!(
+                    "{mark} {} visible {:<7} hidden {:<7} diff {:>4}  {:>5} ms  {}{}",
+                    o.index,
+                    sc(&o.visible),
+                    sc(&o.hidden),
+                    o.diff_lines,
+                    o.ms,
+                    o.hypothesis,
+                    o.error.as_ref().map(|e| format!("  ERROR {e}")).unwrap_or_default()
+                );
+            }
+            match r.winner {
+                Some(w) if r.merged => println!("merged attempt {w} into the worktree; the session continues from it. Others: rune heads"),
+                Some(w) => println!("attempt {w} won but was not merged: {}", r.merge_conflicts.join(", ")),
+                None => println!("no attempt passed; nothing merged. All attempts are on their branches: rune heads"),
+            }
+            return Ok(());
         }
         _ => {}
     }
@@ -384,7 +502,7 @@ fn run(cli: Cli) -> Result<()> {
             let ev = eng.record_tree(&branch, "check", &tree, json!({ "cmd": cmd, "exit": r.exit, "score": r.score, "cached": r.cached, "duration_ms": r.duration_ms, "output": r.tail }))?;
             println!("{} {} (passed {}, failed {}, {}){}", if r.score.green { "✓" } else { "✗" }, cmd, r.score.passed, r.score.failed, if r.cached { "cached".into() } else { format!("{} ms", r.duration_ms) }, format!("  [{}]", ev.short()));
         }
-        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Chat { .. } | Cmd::Run { .. } => unreachable!(),
+        Cmd::Hook { .. } | Cmd::Classify { .. } | Cmd::Install { .. } | Cmd::Chat { .. } | Cmd::Run { .. } | Cmd::Search { .. } => unreachable!(),
     }
     Ok(())
 }

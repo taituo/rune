@@ -9,8 +9,10 @@ pub mod checks;
 pub mod classify;
 pub mod engine;
 pub mod hook;
+pub mod layer;
 pub mod ops;
 pub mod rewind;
+pub mod search;
 pub mod store;
 pub mod world;
 

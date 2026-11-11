@@ -121,6 +121,24 @@ pub fn run(eng: &Engine, tree: &str, cmd: &str, timeout: Duration) -> Result<Che
     }
     let dir = eng.home.join("checks").join(&eng.world.key);
     eng.world.checkout_into(&dir, tree)?;
+    let (exit, out, duration_ms) = exec(&dir, cmd, timeout)?;
+    let kept = tail(&out, 200);
+    eng.store.put_result(tree, cmd, exit, &kept)?;
+    Ok(CheckResult {
+        cmd: cmd.into(),
+        tree: tree.into(),
+        exit,
+        // Scored from the same kept tail as a cache hit would be, so fresh and cached results agree.
+        score: parse(&kept, exit),
+        tail: tail(&out, 40),
+        duration_ms,
+        cached: false,
+    })
+}
+
+/// Run `cmd` in `dir` (offline when possible), in its own process group, killed on timeout.
+/// Returns (exit, combined output, milliseconds). Exit -2 = timed out.
+pub fn exec(dir: &Path, cmd: &str, timeout: Duration) -> Result<(i64, String, u64)> {
     let start = Instant::now();
     let mut c = if crate::agent::tools::offline_available() {
         let mut c = Command::new("unshare");
@@ -131,10 +149,12 @@ pub fn run(eng: &Engine, tree: &str, cmd: &str, timeout: Duration) -> Result<Che
         c.arg("-c").arg(cmd);
         c
     };
-    let out_path = dir.with_extension("out");
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let out_path = std::env::temp_dir().join(format!("rune-check-{}-{seq}.out", std::process::id()));
     let f = std::fs::File::create(&out_path)?;
     let mut child = std::os::unix::process::CommandExt::process_group(
-        c.current_dir(&dir).stdin(Stdio::null()).stdout(f.try_clone()?).stderr(f).env("CI", "1").env("RUNE_CHECK", "1"),
+        c.current_dir(dir).stdin(Stdio::null()).stdout(f.try_clone()?).stderr(f).env("CI", "1").env("RUNE_CHECK", "1"),
         0,
     )
     .spawn()?;
@@ -147,22 +167,12 @@ pub fn run(eng: &Engine, tree: &str, cmd: &str, timeout: Duration) -> Result<Che
             let _ = child.wait();
             break -2;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(Duration::from_millis(10));
     };
     let out = String::from_utf8_lossy(&std::fs::read(&out_path).unwrap_or_default()).into_owned();
+    let _ = std::fs::remove_file(&out_path);
     let out = if exit == -2 { format!("{out}\n[check timed out after {}s]", timeout.as_secs()) } else { out };
-    let kept = tail(&out, 200);
-    eng.store.put_result(tree, cmd, exit, &kept)?;
-    Ok(CheckResult {
-        cmd: cmd.into(),
-        tree: tree.into(),
-        exit,
-        // Scored from the same kept tail as a cache hit would be, so fresh and cached results agree.
-        score: parse(&kept, exit),
-        tail: tail(&out, 40),
-        duration_ms: start.elapsed().as_millis() as u64,
-        cached: false,
-    })
+    Ok((exit, out, start.elapsed().as_millis() as u64))
 }
 
 fn tail(s: &str, lines: usize) -> String {

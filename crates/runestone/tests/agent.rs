@@ -257,6 +257,7 @@ fn bash_background_and_timeout() {
         tmp: wt.path().join(".tmp-test"),
         seen: Default::default(),
         offline: false,
+        alias: None,
     };
     let t = std::time::Instant::now();
     let o = ctx.run("Bash", &json!({ "command": "sleep 20 & echo started" }));

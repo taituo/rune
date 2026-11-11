@@ -95,6 +95,10 @@ pub struct Ctx {
     pub seen: HashMap<String, String>,
     /// Run the next Bash call without network (its own user + network namespace).
     pub offline: bool,
+    /// The path the agent sees for `worktree` (forks show the main worktree's path). Paths the agent
+    /// sends are mapped from it, and tool output is mapped back to it, so a fork's conversation stays
+    /// valid after the fork directory is gone.
+    pub alias: Option<PathBuf>,
 }
 
 /// Can we run commands in an unprivileged user + network namespace on this machine?
@@ -136,7 +140,22 @@ impl Ctx {
     pub fn resolve(&self, p: &str) -> PathBuf {
         let p = Path::new(p);
         let joined = if p.is_absolute() { p.to_path_buf() } else { self.worktree.join(p) };
-        normalize(&joined)
+        let joined = normalize(&joined);
+        match &self.alias {
+            Some(a) => match joined.strip_prefix(a) {
+                Ok(rest) => self.worktree.join(rest),
+                Err(_) => joined,
+            },
+            None => joined,
+        }
+    }
+
+    /// Replace the real root with the alias in text shown to the agent.
+    fn present(&self, text: String) -> String {
+        match &self.alias {
+            Some(a) => text.replace(&*self.worktree.to_string_lossy(), &a.to_string_lossy()),
+            None => text,
+        }
     }
 
     pub fn inside(&self, p: &Path) -> bool {
@@ -153,7 +172,9 @@ impl Ctx {
             "Glob" => self.glob(input),
             _ => Ok(Outcome::err(format!("Unknown tool: {name}"))),
         };
-        r.unwrap_or_else(|e| Outcome::err(format!("Error: {e:#}")))
+        let mut o = r.unwrap_or_else(|e| Outcome::err(format!("Error: {e:#}")));
+        o.text = self.present(std::mem::take(&mut o.text));
+        o
     }
 
     fn path_arg(&self, input: &Value) -> Result<PathBuf> {
@@ -290,10 +311,20 @@ impl Ctx {
     }
 
     fn bash(&self, input: &Value) -> Result<Outcome> {
-        let cmd = input["command"].as_str().unwrap_or("");
-        if cmd.trim().is_empty() {
+        let raw = input["command"].as_str().unwrap_or("");
+        if raw.trim().is_empty() {
             return Ok(Outcome::err("command is empty"));
         }
+        // In a fork, the agent addresses the main worktree's path; point it at the fork instead.
+        // String-level only: a path built indirectly (env var, symlink) can still reach the real tree.
+        let mapped;
+        let cmd = match &self.alias {
+            Some(a) => {
+                mapped = raw.replace(&*a.to_string_lossy(), &self.worktree.to_string_lossy());
+                mapped.as_str()
+            }
+            None => raw,
+        };
         let timeout = Duration::from_millis(input["timeout"].as_u64().unwrap_or(120_000).clamp(1_000, 600_000));
         std::fs::create_dir_all(&self.tmp)?;
         // Output goes to a file, not a pipe: a background child (`npm run dev &`) holding the pipe open would

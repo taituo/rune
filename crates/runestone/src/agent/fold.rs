@@ -69,7 +69,7 @@ pub fn fold(store: &Store, chain: &[Event]) -> Result<Folded> {
                     m.user(blocks);
                 }
             }
-            "check" => {
+            "check" | "search.merge" => {
                 if let Some(n) = ev.str("note") {
                     m.user(vec![json!({ "type": "text", "text": n })]);
                 }

@@ -239,6 +239,18 @@ impl Scripted {
     pub fn new(responses: Vec<Value>) -> Self {
         Scripted { responses: RefCell::new(responses.into()), requests: RefCell::new(vec![]) }
     }
+
+    /// A JSON array of assistant messages (each `{"content": [...], "stop_reason": ...}`), or of bare
+    /// content arrays.
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        let v: Value = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("read {}", path.display()))?)?;
+        let items = v.as_array().context("script must be a JSON array")?;
+        let msgs = items
+            .iter()
+            .map(|m| if m.is_array() { msg(m.as_array().cloned().unwrap_or_default()) } else { m.clone() })
+            .collect();
+        Ok(Self::new(msgs))
+    }
 }
 
 impl Provider for Scripted {

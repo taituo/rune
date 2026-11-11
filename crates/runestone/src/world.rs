@@ -59,6 +59,14 @@ pub struct World {
     pub worktree: PathBuf,
     pub git_dir: PathBuf,
     pub key: String,
+    /// Index file used for snapshots of this world (each fork has its own; objects are shared).
+    pub(crate) index_path: PathBuf,
+    /// Set for a layered (overlay) fork: snapshots read the upper layer instead of scanning the tree.
+    pub(crate) layer: Option<crate::layer::LayerRef>,
+    /// path -> (mtime, size, mode, blob) so unchanged upper files are not re-hashed.
+    pub(crate) hashes: std::cell::RefCell<std::collections::HashMap<PathBuf, (std::time::SystemTime, u64, u32, String)>>,
+    /// The path the agent should see instead of `worktree` (a fork shows the main worktree's path).
+    pub alias: Option<PathBuf>,
 }
 
 impl World {
@@ -67,7 +75,8 @@ impl World {
             .with_context(|| format!("worktree {}", worktree.display()))?;
         let key = hex::encode(Sha256::digest(worktree.to_string_lossy().as_bytes()))[..16].to_string();
         let git_dir = home.join("repos").join(&key);
-        let w = World { worktree, git_dir, key };
+        let index_path = git_dir.join("index");
+        let w = World { worktree, git_dir, key, index_path, layer: None, hashes: Default::default(), alias: None };
         if !w.git_dir.join("HEAD").exists() {
             w.init()?;
         }
@@ -112,7 +121,31 @@ impl World {
     }
 
     fn index(&self) -> PathBuf {
-        self.git_dir.join("index")
+        self.index_path.clone()
+    }
+
+    /// Run git with `input` on stdin.
+    pub(crate) fn git_stdin(&self, index: &Path, args: &[&str], input: &[u8]) -> Result<String> {
+        use std::io::Write as _;
+        let mut c = self.cmd(index, &self.worktree);
+        c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = c.spawn().context("spawn git")?;
+        let mut stdin = child.stdin.take().unwrap();
+        let input = input.to_vec();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+        });
+        let out = child.wait_with_output()?;
+        let _ = writer.join();
+        // check-ignore exits 1 when nothing matched: that is not an error
+        if !out.status.success() && !(args.first() == Some(&"check-ignore") && out.status.code() == Some(1)) {
+            bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    pub(crate) fn git_with_index(&self, index: &Path, args: &[&str]) -> Result<String> {
+        run(self.cmd(index, &self.worktree).args(args))
     }
 
     pub fn git(&self, args: &[&str]) -> Result<String> {
@@ -123,8 +156,12 @@ impl World {
         run(self.cmd(index, work_tree).args(args))
     }
 
-    /// Snapshot the live worktree. Unchanged tree = same id, no new objects.
+    /// Snapshot the live worktree. Unchanged tree = same id, no new objects. A layered fork reads only its
+    /// upper layer, so the cost follows the changes, not the size of the tree.
     pub fn snapshot(&self) -> Result<String> {
+        if self.layer.is_some() {
+            return self.layered_snapshot();
+        }
         self.git(&["add", "-A", "--ignore-errors", "."]).or_else(|_| self.git(&["add", "-A", "."]))?;
         Ok(self.git(&["write-tree"])?.trim().to_string())
     }
@@ -242,8 +279,12 @@ impl World {
         if self.git_dir.join(&r).exists() {
             return Ok(());
         }
-        self.git(&["update-ref", &r, tree])?;
-        Ok(())
+        match self.git(&["update-ref", &r, tree]) {
+            Ok(_) => Ok(()),
+            // Two forks pinning the same tree at once: whoever lost the lock still has it pinned.
+            Err(_) if self.git_dir.join(&r).exists() => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Move a long-lived directory (the check workspace) to `tree`, rewriting only what changed. Ignored

@@ -156,7 +156,16 @@ impl<'a> Session<'a> {
     }
 
     pub fn turn(&mut self, prompt: &str) -> Result<TurnResult> {
-        let ev = self.eng.record(&self.branch, "turn.start", json!({ "harness": "rune", "prompt": prompt }))?;
+        self.turn_with(prompt, None)
+    }
+
+    /// A turn whose user message is preceded by a harness note (e.g. the approach a search branch takes).
+    pub fn turn_with(&mut self, prompt: &str, note: Option<&str>) -> Result<TurnResult> {
+        let mut body = json!({ "harness": "rune", "prompt": prompt });
+        if let Some(n) = note {
+            body["note"] = json!(n);
+        }
+        let ev = self.eng.record(&self.branch, "turn.start", body)?;
         if let Some(n) = ev.str("note") {
             self.ui.note(n);
         }
@@ -221,7 +230,7 @@ impl<'a> Session<'a> {
                 }
                 return Ok(TurnResult { text, steps: step, stop });
             }
-            let mut ctx = tools::Ctx { worktree: self.eng.world.worktree.clone(), tmp: tmp.clone(), seen: folded.seen, offline: false };
+            let mut ctx = tools::Ctx { worktree: self.eng.world.worktree.clone(), tmp: tmp.clone(), seen: folded.seen, offline: false, alias: self.eng.world.alias.clone() };
             for tu in uses {
                 let (id, name, input) = (tu["id"].as_str().unwrap_or(""), tu["name"].as_str().unwrap_or(""), &tu["input"]);
                 if name == "Rewind" {
