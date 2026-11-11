@@ -64,6 +64,9 @@ impl Anthropic {
         let reader = std::io::BufReader::new(resp.into_reader());
         let mut acc = Accumulator::default();
         for line in reader.lines() {
+            if super::cancel::is_set() {
+                return Err(Attempt { retry: false, wait: None, err: anyhow::Error::new(super::cancel::Interrupted) });
+            }
             let line = line.map_err(|e| Attempt { retry: true, wait: None, err: anyhow!("stream: {e}") })?;
             let Some(data) = line.strip_prefix("data:") else { continue };
             let ev: Value = match serde_json::from_str(data.trim()) {
@@ -96,7 +99,7 @@ impl Provider for Anthropic {
         for attempt in 1..=6 {
             match self.once(body, on) {
                 Ok(v) => return Ok(v),
-                Err(a) if a.retry && attempt < 6 => {
+                Err(a) if a.retry && attempt < 6 && !super::cancel::is_set() => {
                     let wait = a.wait.unwrap_or(delay).min(60);
                     on(Delta::Retry(&format!("{} — retrying in {wait}s", a.err)));
                     std::thread::sleep(Duration::from_secs(wait));

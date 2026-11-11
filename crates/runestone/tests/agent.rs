@@ -274,3 +274,35 @@ fn bash_background_and_timeout() {
     let o = ctx.run("Grep", &json!({ "pattern": "hel+o", "output_mode": "content" }));
     assert!(o.text.contains("hello"), "{}", o.text);
 }
+
+#[test]
+fn interrupt_kills_the_running_command_and_keeps_the_record_valid() {
+    let (_h, _wt, eng) = setup();
+    let script = Rc::new(Scripted::new(vec![
+        msg(vec![
+            tool_use("s1", "Bash", json!({ "command": "sleep 30" })),
+            tool_use("s2", "Bash", json!({ "command": "echo never" })),
+        ]),
+        // next turn
+        msg(vec![text("ok")]),
+    ]));
+    let mut s = session(&eng, &script, Permission::Auto);
+    let cancel = eng.cancel.clone();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let start = std::time::Instant::now();
+    let r = s.turn("long task").unwrap();
+    t.join().unwrap();
+    assert!(start.elapsed().as_secs() < 5, "the sleep must be killed");
+    assert_eq!(r.stop, "interrupted");
+
+    // The next turn works, and the request carries a result for both tool calls.
+    let r2 = s.turn("continue").unwrap();
+    assert_eq!(r2.text, "ok");
+    let results = all_results(&request(&script, 1));
+    assert!(results[0].1 && results[0].0.contains("interrupted by the user"), "{:?}", results[0]);
+    assert!(results[1].1 && results[1].0.contains("Not run"), "{:?}", results[1]);
+    assert!(verify_requests(&eng, &s.branch).unwrap().iter().all(|x| x.1));
+}

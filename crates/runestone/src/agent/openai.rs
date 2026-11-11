@@ -146,6 +146,9 @@ impl OpenAi {
         }
         let mut acc = Acc::default();
         for line in reader.lines() {
+            if super::cancel::is_set() {
+                return Err((false, anyhow::Error::new(super::cancel::Interrupted)));
+            }
             let line = line.map_err(|e| (true, anyhow!("stream: {e}")))?;
             let Some(data) = line.strip_prefix("data:") else { continue };
             let data = data.trim();
@@ -168,7 +171,7 @@ impl Provider for OpenAi {
         for attempt in 1..=5 {
             match self.once(body, on) {
                 Ok(v) => return Ok(v),
-                Err((true, e)) if attempt < 5 => {
+                Err((true, e)) if attempt < 5 && !super::cancel::is_set() => {
                     on(Delta::Retry(&format!("{e} — retrying in {delay}s")));
                     std::thread::sleep(Duration::from_secs(delay));
                     delay = (delay * 2).min(30);

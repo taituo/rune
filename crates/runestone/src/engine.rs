@@ -31,6 +31,8 @@ pub struct Engine {
     pub home: PathBuf,
     /// branch -> folded conversation at its last head, so a step folds only new events.
     pub(crate) fold_cache: std::cell::RefCell<std::collections::HashMap<String, crate::agent::fold::Folder>>,
+    /// Set to interrupt the running turn (the CLI's Ctrl-C handler holds a clone).
+    pub cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Engine {
@@ -41,7 +43,7 @@ impl Engine {
     pub fn open_in(home: &Path, worktree: &Path) -> Result<Self> {
         let world = World::open(home, worktree)?;
         let store = Store::open(&home.join("rune.db"))?;
-        Ok(Engine { store, world, home: home.to_path_buf(), fold_cache: Default::default() })
+        Ok(Engine { store, world, home: home.to_path_buf(), fold_cache: Default::default(), cancel: Default::default() })
     }
 
     /// Branch names are namespaced by worktree.

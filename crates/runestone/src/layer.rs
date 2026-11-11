@@ -353,7 +353,7 @@ impl Engine {
             alias: Some(parent.world.worktree.clone()),
             odb: crate::objects::Odb::new(&parent.world.git_dir),
         };
-        Ok(Engine { store: Store::open(&parent.home.join("rune.db"))?, world, home: parent.home.clone(), fold_cache: Default::default() })
+        Ok(Engine { store: Store::open(&parent.home.join("rune.db"))?, world, home: parent.home.clone(), fold_cache: Default::default(), cancel: Default::default() })
     }
 
     /// An engine whose world is a mounted layer. Same database and object store as the parent.
@@ -363,6 +363,7 @@ impl Engine {
             world: World::layered(&parent.world, layer, key)?,
             home: parent.home.clone(),
             fold_cache: Default::default(),
+            cancel: Default::default(),
         })
     }
 }

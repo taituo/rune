@@ -266,6 +266,8 @@ impl<'a> Session<'a> {
     /// Continue from the current head (after a crash, or after a rewind the human applied).
     pub fn run_loop(&mut self) -> Result<TurnResult> {
         let tmp = self.eng.home.join("tmp");
+        self.eng.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _cancel = super::cancel::install(self.eng.cancel.clone());
         let mut since_check = 0usize; // file-changing calls since the last check
         let mut dirty = false; // files changed since the last check
         let mut usage = Usage::default();
@@ -281,6 +283,11 @@ impl<'a> Session<'a> {
             });
             let resp = match resp {
                 Ok(r) => r,
+                Err(e) if super::cancel::is_interrupted(&e) => {
+                    self.eng.record(&self.branch, "model.error", json!({ "request": req_hash, "error": "interrupted by the user" }))?;
+                    self.eng.record(&self.branch, "turn.end", json!({ "stop": "interrupted" }))?;
+                    return Ok(TurnResult { text: String::new(), steps: step, stop: "interrupted".into(), usage });
+                }
                 Err(e) => {
                     self.eng.record(&self.branch, "model.error", json!({ "request": req_hash, "error": format!("{e:#}") }))?;
                     return Err(e);
@@ -324,6 +331,15 @@ impl<'a> Session<'a> {
             let mut ctx = tools::Ctx { worktree: self.eng.world.worktree.clone(), tmp: tmp.clone(), seen, offline: false, alias: self.eng.world.alias.clone() };
             for tu in uses {
                 let (id, name, input) = (tu["id"].as_str().unwrap_or(""), tu["name"].as_str().unwrap_or(""), &tu["input"]);
+                if super::cancel::is_set() {
+                    // Every tool_use still gets a result, so the conversation stays valid for the next turn.
+                    self.eng.record(
+                        &self.branch,
+                        "tool.post",
+                        json!({ "call": id, "tool": name, "summary": "not run", "result": "Not run: the user interrupted the turn.", "is_error": true }),
+                    )?;
+                    continue;
+                }
                 if name == "Rewind" {
                     match self.self_rewind(id, input)? {
                         None => break, // rewound: everything after the point, including the rest of this message, is gone
@@ -339,6 +355,10 @@ impl<'a> Session<'a> {
                     since_check += 1;
                     dirty = true;
                 }
+            }
+            if super::cancel::is_set() {
+                self.eng.record(&self.branch, "turn.end", json!({ "stop": "interrupted" }))?;
+                return Ok(TurnResult { text, steps: step, stop: "interrupted".into(), usage });
             }
             let every = self.checks.as_ref().map(|c| c.every).unwrap_or(0);
             if every > 0 && since_check >= every {

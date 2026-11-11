@@ -116,7 +116,8 @@ Without hooks you can drive it by hand: `rune record turn.start|tool.pre|tool.po
 - Excluded paths are never restored and not yet reported as "changed but excluded".
 - No daemon/JSON-RPC yet; the library API is the API.
 - No compaction yet (1M context); record-built compaction is next.
-- No Ctrl-C interrupt inside a turn; killing the process is safe (resume closes dangling calls).
+- Ctrl-C interrupts a turn; a model call still waiting for its first byte only notices at the next stream
+  line (press Ctrl-C again to quit; resume closes dangling calls).
 - In search forks, Bash runs in a mount namespace with the fork mounted over the main worktree path; the file
   tools map paths by prefix, so an absolute symlink to the main path is still followed to the live tree.
 - Per-event cost is dominated by git subprocesses; next step is in-process object and tree writing.

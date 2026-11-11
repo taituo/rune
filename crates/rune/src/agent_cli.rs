@@ -190,9 +190,28 @@ fn checks_for(eng: &Engine, o: &Opts) -> Option<agent::session::Checks> {
     })
 }
 
+/// Ctrl-C during a turn interrupts it (the running command is killed, the turn ends cleanly);
+/// a second Ctrl-C, or one at the prompt, exits.
+fn install_interrupt(eng: &Engine) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    use std::sync::atomic::Ordering;
+    let in_turn = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (flag, cancel) = (in_turn.clone(), eng.cancel.clone());
+    let _ = ctrlc::set_handler(move || {
+        if flag.load(Ordering::SeqCst) && !cancel.swap(true, Ordering::SeqCst) {
+            eprintln!("\n{YELLOW}interrupting… (Ctrl-C again to quit){OFF}");
+        } else {
+            std::process::exit(130);
+        }
+    });
+    in_turn
+}
+
 pub fn run_once(eng: &Engine, branch: Option<&str>, o: &Opts, prompt: &str) -> Result<()> {
     let mut s = open_session(eng, branch, o)?;
+    let in_turn = install_interrupt(eng);
+    in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
     let r = s.turn(prompt)?;
+    in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
     println!();
     eprintln!("{DIM}[{} · {} steps · {} · {}]{OFF}", short_branch(&s.branch), r.steps, r.stop, usage_line(&r.usage));
     Ok(())
@@ -211,6 +230,7 @@ pub fn usage_line(u: &agent::session::Usage) -> String {
 
 pub fn chat(eng: &Engine, branch: Option<&str>, o: &Opts) -> Result<()> {
     let mut s = open_session(eng, branch, o)?;
+    let in_turn = install_interrupt(eng);
     eprintln!(
         "{DIM}rune · {} · {} · {} · checks: {} · /help for commands{OFF}",
         short_branch(&s.branch),
@@ -251,7 +271,11 @@ pub fn chat(eng: &Engine, branch: Option<&str>, o: &Opts) -> Result<()> {
             }
             continue;
         }
-        match s.turn(input) {
+        in_turn.store(true, std::sync::atomic::Ordering::SeqCst);
+        let res = s.turn(input);
+        in_turn.store(false, std::sync::atomic::Ordering::SeqCst);
+        match res {
+            Ok(r) if r.stop == "interrupted" => eprintln!("\n{YELLOW}[interrupted after {} steps; the record is consistent, continue with a new message]{OFF}", r.steps),
             Ok(r) => eprintln!("\n{DIM}[{} steps · {}]{OFF}", r.steps, usage_line(&r.usage)),
             Err(e) => eprintln!("\n{RED}{e:#}{OFF}\n{DIM}(the record is intact; /continue retries){OFF}"),
         }

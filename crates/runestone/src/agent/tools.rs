@@ -371,9 +371,19 @@ impl Ctx {
             .spawn()?;
         let start = Instant::now();
         let mut timed_out = false;
+        let mut interrupted = false;
         let status = loop {
             if let Some(s) = child.try_wait()? {
                 break Some(s);
+            }
+            if super::cancel::is_set() {
+                interrupted = true;
+                let pg = format!("-{}", child.id());
+                let _ = Command::new("kill").args(["-TERM", "--", &pg]).status();
+                std::thread::sleep(Duration::from_millis(200));
+                let _ = Command::new("kill").args(["-KILL", "--", &pg]).status();
+                let _ = child.wait();
+                break None;
             }
             if start.elapsed() > timeout {
                 timed_out = true;
@@ -391,7 +401,9 @@ impl Ctx {
         let _ = std::fs::remove_file(&out_path);
         let mut text = clip_middle(&String::from_utf8_lossy(&buf), MAX_OUTPUT);
         let exit = status.and_then(|s| s.code()).map(|c| c as i64);
-        if timed_out {
+        if interrupted {
+            text += "\n[interrupted by the user; process group killed]";
+        } else if timed_out {
             text += &format!("\n[timed out after {}s; process group killed]", timeout.as_secs());
         } else if let Some(c) = exit {
             if c != 0 {
@@ -404,7 +416,7 @@ impl Ctx {
         if self.offline {
             text += "\n[ran without network access]";
         }
-        Ok(Outcome { text, is_error: timed_out || exit.is_some_and(|c| c != 0), exit, seen: HashMap::new() })
+        Ok(Outcome { text, is_error: interrupted || timed_out || exit.is_some_and(|c| c != 0), exit, seen: HashMap::new() })
     }
 
     fn grep(&self, input: &Value) -> Result<Outcome> {

@@ -68,7 +68,9 @@ design notes doc ("rune: design notes, deep pass").
 - [ ] Two sessions in one worktree share the shadow index: lock or separate it.
 - [ ] Per-call cgroups + fanotify so background writers (`npm run dev &`) stay attributed.
 - [ ] Mechanical changes (formatters) detected by re-running the tool; re-derived on rewind instead of merged.
-- [ ] Ctrl-C interrupts a turn cleanly.
+- [x] Ctrl-C interrupts a turn: the running command's process group is killed, remaining tool calls get
+      "Not run" results, the turn ends as `interrupted`; a second Ctrl-C exits. A model call that is still
+      waiting for its first byte notices only at the next stream line.
 - [ ] Optimistic-lock guard for the hook path (Claude Code / Kiro), like rune's own read-before-write.
 
 ## Features from the design
