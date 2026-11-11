@@ -278,3 +278,39 @@ fn hook_ingestion_claude_format() {
     assert_eq!(post.str("call"), Some("toolu_1"));
     assert!(lin.iter().any(|e| e.kind == "tool.blocked"));
 }
+
+#[test]
+fn in_process_diff_matches_git_numstat() {
+    let (_h, wt, eng) = setup();
+    let d = wt.path();
+    fs::create_dir_all(d.join("a/b")).unwrap();
+    fs::write(d.join("a/b/deep.txt"), "1\n2\n3\n").unwrap();
+    fs::write(d.join("bin.dat"), [0u8, 1, 2, 3]).unwrap();
+    fs::write(d.join("noeol.txt"), "x\ny").unwrap();
+    fs::write(d.join("turns_into_dir"), "file\n").unwrap();
+    let t1 = eng.world.snapshot().unwrap();
+    edit_line(d, "handler.go", 7, "changed seven");
+    fs::write(d.join("handler.go"), fs::read_to_string(d.join("handler.go")).unwrap() + "appended\n").unwrap();
+    fs::remove_dir_all(d.join("a")).unwrap();
+    fs::write(d.join("bin.dat"), [0u8, 9, 9]).unwrap();
+    fs::write(d.join("noeol.txt"), "x\ny\nz").unwrap();
+    fs::remove_file(d.join("turns_into_dir")).unwrap();
+    fs::create_dir(d.join("turns_into_dir")).unwrap();
+    fs::write(d.join("turns_into_dir/inner"), "in\n").unwrap();
+    fs::write(d.join("new.txt"), "").unwrap();
+    let t2 = eng.world.snapshot().unwrap();
+
+    let ours: Vec<String> = eng.world.diff(&t1, &t2).unwrap().iter().map(|c| format!("{}\t{}\t{}\t{}", c.status, c.added.map(|x| x.to_string()).unwrap_or("-".into()), c.deleted.map(|x| x.to_string()).unwrap_or("-".into()), c.path)).collect();
+    let ns = eng.world.git(&["diff-tree", "-r", "--no-renames", "--numstat", &t1, &t2]).unwrap();
+    let st = eng.world.git(&["diff-tree", "-r", "--no-renames", "--name-status", &t1, &t2]).unwrap();
+    let mut git: Vec<String> = ns
+        .lines()
+        .zip(st.lines())
+        .map(|(n, s)| {
+            let f: Vec<&str> = n.split('\t').collect();
+            format!("{}\t{}\t{}\t{}", s.chars().next().unwrap(), f[0], f[1], f[2])
+        })
+        .collect();
+    git.sort_by(|a, b| a.split('\t').nth(3).cmp(&b.split('\t').nth(3)));
+    assert_eq!(ours, git);
+}

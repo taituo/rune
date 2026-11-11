@@ -57,9 +57,10 @@ inside one. `--script DIR` runs scripted attempts (`attempt-<i>.json`) instead o
 
 Measured (2-core VM, 20k-file tree, 10 steps per attempt): layered snapshots equal a full scan (tested,
 including deletions, replaced directories, ignored files, modes and symlinks); a fork mounts in 2–40 ms;
-but a step costs about as much as on the scan world (88–102 vs 111–115 ms with one attempt), because the
-cost is git subprocesses (~7 per event, `write-tree` most) and full-index rewrites, not the tree scan.
-Parallel attempts are CPU-bound: 16 attempts gave ~15 steps/s in aggregate vs ~9 for one.
+and since objects, trees, diffs and ignore rules are handled in-process, a layered event spawns no git
+process: 26 ms per step vs 101 ms on the scan world with one attempt, 88 ms per step with 16 attempts on
+2 cores (≈160 steps/s in aggregate once the base exists). Materializing the base tree (0.6–5 s for 20k files)
+now dominates a search's start.
 
 ## Versioned world
 

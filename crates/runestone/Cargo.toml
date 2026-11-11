@@ -16,6 +16,10 @@ ureq = "2"
 globset = "0.4"
 walkdir = "2"
 xattr = "1"
+sha1 = "0.10"
+flate2 = "1"
+similar = "2"
+ignore = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

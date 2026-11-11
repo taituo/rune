@@ -144,6 +144,7 @@ impl World {
             layer: Some(LayerRef { base_tree: layer.base_tree.clone(), upper: layer.upper.clone() }),
             hashes: Default::default(),
             alias: Some(parent.worktree.clone()),
+            odb: crate::objects::Odb::new(&parent.git_dir),
         })
     }
 
@@ -153,74 +154,28 @@ impl World {
         let mut removed: Vec<String> = Vec::new();
         walk(&l.upper, "", &mut files, &mut removed)?;
 
-        // Respect the project's .gitignore and rune's excludes for added files.
-        if !files.is_empty() {
-            let mut input = Vec::new();
-            for (rel, _, _) in &files {
-                input.extend_from_slice(rel.as_bytes());
-                input.push(0);
-            }
-            let ignored = self.git_stdin(&self.index_path, &["check-ignore", "--stdin", "-z", "--no-index"], &input)?;
-            let ignored: std::collections::HashSet<&str> = ignored.split('\0').filter(|s| !s.is_empty()).collect();
-            if !ignored.is_empty() {
-                files.retain(|(rel, _, _)| !ignored.contains(rel.as_str()));
-            }
-        }
+        // Respect the project's .gitignore files and rune's excludes for added files.
+        let mut ig = Ignores::new(&self.worktree, &self.git_dir.join("info/exclude"));
+        files.retain(|(rel, _, _)| !ig.ignored(rel));
 
-        // Start from a cached index of the base tree.
-        let base_index = self.git_dir.join("base-index").join(&l.base_tree);
-        if !base_index.exists() {
-            std::fs::create_dir_all(base_index.parent().unwrap())?;
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = PathBuf::from(format!("{}.tmp-{}-{seq}", base_index.display(), std::process::id()));
-            self.git_with_index(&tmp, &["read-tree", &l.base_tree])?;
-            std::fs::rename(&tmp, &base_index)?;
-        }
-        // Not with_extension: the key is part of the file name, and every fork needs its own scratch index.
-        let idx = PathBuf::from(format!("{}.next", self.index_path.display()));
-        std::fs::copy(&base_index, &idx)?;
-
-        if !removed.is_empty() {
-            let mut input = Vec::new();
-            for r in &removed {
-                input.extend_from_slice(r.as_bytes());
-                input.push(0);
-            }
-            self.git_stdin(&idx, &["rm", "-r", "--cached", "-q", "--ignore-unmatch", "--pathspec-from-file=-", "--pathspec-file-nul"], &input)?;
-        }
-
-        // Hash only what changed since the last snapshot of this layer.
-        let mut cache = self.hashes.borrow_mut();
-        let mut todo: Vec<usize> = Vec::new();
-        for (i, (_, abs, m)) in files.iter().enumerate() {
-            let fresh = cache.get(abs).is_some_and(|c| Some(c.0) == m.modified().ok() && c.1 == m.len() && c.2 == m.mode());
-            if !fresh {
-                todo.push(i);
-            }
-        }
-        let (links, regular): (Vec<usize>, Vec<usize>) = todo.into_iter().partition(|&i| files[i].2.file_type().is_symlink());
-        if !regular.is_empty() {
-            let mut input = String::new();
-            for &i in &regular {
-                input.push_str(&files[i].1.to_string_lossy());
-                input.push('\n');
-            }
-            let out = self.git_stdin(&idx, &["hash-object", "-w", "--no-filters", "--stdin-paths"], input.as_bytes())?;
-            for (&i, sha) in regular.iter().zip(out.lines()) {
-                let m = &files[i].2;
-                cache.insert(files[i].1.clone(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), m.mode(), sha.to_string()));
-            }
-        }
-        for &i in &links {
-            let target = std::fs::read_link(&files[i].1)?;
-            let sha = self.git_stdin(&idx, &["hash-object", "-w", "--stdin"], target.to_string_lossy().as_bytes())?;
-            let m = &files[i].2;
-            cache.insert(files[i].1.clone(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), m.mode(), sha.trim().to_string()));
-        }
-        if !files.is_empty() {
-            let mut info = Vec::new();
+        // Blobs: hash only what changed since the last snapshot of this layer, written in-process.
+        let mut items: Vec<(String, Option<(String, String)>)> = removed.into_iter().map(|r| (r, None)).collect();
+        {
+            let mut cache = self.hashes.borrow_mut();
             for (rel, abs, m) in &files {
+                let fresh = cache.get(abs).filter(|c| Some(c.0) == m.modified().ok() && c.1 == m.len() && c.2 == m.mode());
+                let sha = match fresh {
+                    Some(c) => c.3.clone(),
+                    None => {
+                        let sha = if m.file_type().is_symlink() {
+                            self.odb.write("blob", std::fs::read_link(abs)?.to_string_lossy().as_bytes())?
+                        } else {
+                            self.odb.write_blob_file(abs)?
+                        };
+                        cache.insert(abs.clone(), (m.modified().unwrap_or(std::time::UNIX_EPOCH), m.len(), m.mode(), sha.clone()));
+                        sha
+                    }
+                };
                 let mode = if m.file_type().is_symlink() {
                     "120000"
                 } else if m.mode() & 0o111 != 0 {
@@ -228,15 +183,124 @@ impl World {
                 } else {
                     "100644"
                 };
-                let sha = &cache.get(abs).expect("hashed").3;
-                info.extend_from_slice(format!("{mode} {sha}\t{rel}").as_bytes());
-                info.push(0);
+                items.push((rel.clone(), Some((mode.to_string(), sha))));
             }
-            self.git_stdin(&idx, &["update-index", "-z", "--index-info"], &info)?;
         }
-        let tree = self.git_with_index(&idx, &["write-tree"])?.trim().to_string();
-        std::fs::rename(&idx, &self.index_path)?;
-        Ok(tree)
+        // Component-wise order keeps each directory's changes contiguous, and puts a deletion of "d"
+        // (whiteout or opaque dir) before additions under "d/".
+        items.sort_by(|a, b| a.0.split('/').cmp(b.0.split('/')).then(a.1.is_some().cmp(&b.1.is_some())));
+        let tree = self.build_tree(Some(&l.base_tree), "", &items)?;
+        Ok(tree.unwrap_or_else(|| crate::objects::EMPTY_TREE.to_string()))
+    }
+
+    /// Rebuild only the directories that have changes; untouched subtrees keep their hashes.
+    fn build_tree(&self, base: Option<&str>, dir: &str, items: &[(String, Option<(String, String)>)]) -> Result<Option<String>> {
+        use crate::objects::Entry;
+        let mut entries: std::collections::BTreeMap<String, Entry> = match base {
+            Some(b) => self.odb.read_tree(b)?.iter().map(|e| (e.name.clone(), e.clone())).collect(),
+            None => Default::default(),
+        };
+        let rel = |p: &str| -> String { if dir.is_empty() { p.to_string() } else { p[dir.len() + 1..].to_string() } };
+        let mut i = 0;
+        while i < items.len() {
+            let r = rel(&items[i].0);
+            let first = r.split('/').next().unwrap_or("").to_string();
+            let mut j = i;
+            while j < items.len() && rel(&items[j].0).split('/').next() == Some(first.as_str()) {
+                j += 1;
+            }
+            let child = if dir.is_empty() { first.clone() } else { format!("{dir}/{first}") };
+            let mut deeper = Vec::new();
+            for it in &items[i..j] {
+                if it.0 == child {
+                    match &it.1 {
+                        None => {
+                            entries.remove(&first);
+                        }
+                        Some((mode, sha)) => {
+                            entries.insert(first.clone(), Entry { mode: mode.clone(), name: first.clone(), sha: sha.clone() });
+                        }
+                    }
+                } else {
+                    deeper.push(it.clone());
+                }
+            }
+            if !deeper.is_empty() {
+                let sub = entries.get(&first).filter(|e| e.is_tree()).map(|e| e.sha.clone());
+                match self.build_tree(sub.as_deref(), &child, &deeper)? {
+                    Some(t) => {
+                        entries.insert(first.clone(), Entry { mode: "40000".into(), name: first.clone(), sha: t });
+                    }
+                    None => {
+                        entries.remove(&first);
+                    }
+                }
+            }
+            i = j;
+        }
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let mut v: Vec<Entry> = entries.into_values().collect();
+        Ok(Some(self.odb.write_tree(&mut v)?))
+    }
+}
+
+/// .gitignore matching in-process: rune's excludes, then each ancestor directory's .gitignore, the
+/// deepest one deciding (as git does).
+struct Ignores {
+    root: PathBuf,
+    exclude: Option<ignore::gitignore::Gitignore>,
+    dirs: std::collections::HashMap<String, Option<ignore::gitignore::Gitignore>>,
+}
+
+impl Ignores {
+    fn new(root: &Path, exclude_file: &Path) -> Self {
+        let mut b = ignore::gitignore::GitignoreBuilder::new(root);
+        for pat in crate::world::DEFAULT_EXCLUDES {
+            let _ = b.add_line(None, pat);
+        }
+        if exclude_file.exists() {
+            let _ = b.add(exclude_file);
+        }
+        Ignores { root: root.to_path_buf(), exclude: b.build().ok(), dirs: Default::default() }
+    }
+
+    fn matcher(&mut self, dir: &str) -> Option<&ignore::gitignore::Gitignore> {
+        if !self.dirs.contains_key(dir) {
+            let d = if dir.is_empty() { self.root.clone() } else { self.root.join(dir) };
+            let f = d.join(".gitignore");
+            let gi = if f.exists() {
+                let mut b = ignore::gitignore::GitignoreBuilder::new(&d);
+                let _ = b.add(&f);
+                b.build().ok()
+            } else {
+                None
+            };
+            self.dirs.insert(dir.to_string(), gi);
+        }
+        self.dirs.get(dir).and_then(|g| g.as_ref())
+    }
+
+    fn ignored(&mut self, rel: &str) -> bool {
+        let full = self.root.join(rel);
+        let comps: Vec<&str> = rel.split('/').collect();
+        for depth in (0..comps.len()).rev() {
+            let dir = comps[..depth].join("/");
+            if let Some(gi) = self.matcher(&dir) {
+                let m = gi.matched_path_or_any_parents(&full, false);
+                if m.is_ignore() {
+                    return true;
+                }
+                if m.is_whitelist() {
+                    return false;
+                }
+            }
+        }
+        match &self.exclude {
+            Some(gi) => gi.matched_path_or_any_parents(&full, false).is_ignore(),
+            None => false,
+        }
     }
 }
 

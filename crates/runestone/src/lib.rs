@@ -10,6 +10,7 @@ pub mod classify;
 pub mod engine;
 pub mod hook;
 pub mod layer;
+pub mod objects;
 pub mod ops;
 pub mod rewind;
 pub mod search;

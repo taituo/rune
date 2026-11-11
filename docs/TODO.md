@@ -43,8 +43,12 @@ design notes doc ("rune: design notes, deep pass").
 
 ## Speed
 
-- [ ] Write git objects and trees in-process (gitoxide or an own tree writer). Today ~7 git subprocesses per
-      event dominate the cost; target < 5 ms per event.
+- [x] Write git objects and trees in-process for layered worlds (own zlib + SHA-1 object writer, tree
+      rebuild of changed directories only, in-process diff and gitignore). 0 git subprocesses per event;
+      26 ms per step vs 101 ms on the scan world (20k files, 2 cores).
+- [ ] Same for the scan world (`git add -A` + `write-tree` still spawn per event), e.g. stat-cache + own index.
+- [ ] Base materialization dominates search start (0.6–5 s for 20k files, I/O-bound and noisy): reuse bases
+      across searches, or populate lazily.
 - [ ] Incremental fold: cache messages per head, fold only new events (today O(events) per step).
 - [ ] Interactive sessions on overlay too (agent layer + merge at turn end), not only search forks.
 - [ ] Warm build caches for search forks (shared, read-only `target/` or sccache).

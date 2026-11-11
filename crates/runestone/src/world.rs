@@ -67,6 +67,8 @@ pub struct World {
     pub(crate) hashes: std::cell::RefCell<std::collections::HashMap<PathBuf, (std::time::SystemTime, u64, u32, String)>>,
     /// The path the agent should see instead of `worktree` (a fork shows the main worktree's path).
     pub alias: Option<PathBuf>,
+    /// In-process object store (no git subprocess for hashing, trees, diffs).
+    pub(crate) odb: crate::objects::Odb,
 }
 
 impl World {
@@ -76,7 +78,8 @@ impl World {
         let key = hex::encode(Sha256::digest(worktree.to_string_lossy().as_bytes()))[..16].to_string();
         let git_dir = home.join("repos").join(&key);
         let index_path = git_dir.join("index");
-        let w = World { worktree, git_dir, key, index_path, layer: None, hashes: Default::default(), alias: None };
+        let odb = crate::objects::Odb::new(&git_dir);
+        let w = World { worktree, git_dir, key, index_path, layer: None, hashes: Default::default(), alias: None, odb };
         if !w.git_dir.join("HEAD").exists() {
             w.init()?;
         }
@@ -124,30 +127,6 @@ impl World {
         self.index_path.clone()
     }
 
-    /// Run git with `input` on stdin.
-    pub(crate) fn git_stdin(&self, index: &Path, args: &[&str], input: &[u8]) -> Result<String> {
-        use std::io::Write as _;
-        let mut c = self.cmd(index, &self.worktree);
-        c.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let mut child = c.spawn().context("spawn git")?;
-        let mut stdin = child.stdin.take().unwrap();
-        let input = input.to_vec();
-        let writer = std::thread::spawn(move || {
-            let _ = stdin.write_all(&input);
-        });
-        let out = child.wait_with_output()?;
-        let _ = writer.join();
-        // check-ignore exits 1 when nothing matched: that is not an error
-        if !out.status.success() && !(args.first() == Some(&"check-ignore") && out.status.code() == Some(1)) {
-            bail!("git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-    }
-
-    pub(crate) fn git_with_index(&self, index: &Path, args: &[&str]) -> Result<String> {
-        run(self.cmd(index, &self.worktree).args(args))
-    }
-
     pub fn git(&self, args: &[&str]) -> Result<String> {
         run(self.cmd(&self.index(), &self.worktree).args(args))
     }
@@ -176,26 +155,7 @@ impl World {
         if a == b {
             return Ok(vec![]);
         }
-        let raw = self.git(&["diff-tree", "-r", "--no-renames", "--name-status", "-z", a, b])?;
-        let num = self.git(&["diff-tree", "-r", "--no-renames", "--numstat", "-z", a, b])?;
-        let mut stats = std::collections::HashMap::new();
-        for rec in num.split('\0').filter(|s| !s.is_empty()) {
-            // "<added>\t<deleted>\t<path>"
-            let mut it = rec.splitn(3, '\t');
-            let (ad, de, p) = (it.next(), it.next(), it.next());
-            if let (Some(ad), Some(de), Some(p)) = (ad, de, p) {
-                stats.insert(p.to_string(), (ad.parse().ok(), de.parse().ok()));
-            }
-        }
-        let parts: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
-        let mut out = Vec::new();
-        for pair in parts.chunks(2) {
-            if let [status, path] = pair {
-                let (added, deleted) = stats.get(*path).cloned().unwrap_or((None, None));
-                out.push(Change { status: status.chars().next().unwrap_or('M'), path: path.to_string(), added, deleted });
-            }
-        }
-        Ok(out)
+        self.odb.diff(a, b)
     }
 
     /// Unified diff between two trees, optionally limited to paths.
@@ -275,16 +235,18 @@ impl World {
         if tree == EMPTY_TREE {
             return Ok(());
         }
-        let r = format!("refs/rune/t/{tree}");
-        if self.git_dir.join(&r).exists() {
+        // A loose ref file, written atomically; equivalent to `git update-ref` for a new ref.
+        let path = self.git_dir.join("refs/rune/t").join(tree);
+        if path.exists() {
             return Ok(());
         }
-        match self.git(&["update-ref", &r, tree]) {
-            Ok(_) => Ok(()),
-            // Two forks pinning the same tree at once: whoever lost the lock still has it pinned.
-            Err(_) if self.git_dir.join(&r).exists() => Ok(()),
-            Err(e) => Err(e),
+        std::fs::create_dir_all(path.parent().unwrap())?;
+        let tmp = path.with_file_name(format!(".{tree}.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, format!("{tree}\n"))?;
+        if std::fs::rename(&tmp, &path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
+        Ok(())
     }
 
     /// Move a long-lived directory (the check workspace) to `tree`, rewriting only what changed. Ignored
