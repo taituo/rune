@@ -176,8 +176,19 @@ pub fn run_once(eng: &Engine, branch: Option<&str>, o: &Opts, prompt: &str) -> R
     let mut s = open_session(eng, branch, o)?;
     let r = s.turn(prompt)?;
     println!();
-    eprintln!("{DIM}[{} · {} steps · {}]{OFF}", short_branch(&s.branch), r.steps, r.stop);
+    eprintln!("{DIM}[{} · {} steps · {} · {}]{OFF}", short_branch(&s.branch), r.steps, r.stop, usage_line(&r.usage));
     Ok(())
+}
+
+pub fn usage_line(u: &agent::session::Usage) -> String {
+    format!(
+        "in {} · cache read {} ({:.0}%) · cache write {} · out {}",
+        u.input,
+        u.cache_read,
+        u.cache_hit() * 100.0,
+        u.cache_write,
+        u.output
+    )
 }
 
 pub fn chat(eng: &Engine, branch: Option<&str>, o: &Opts) -> Result<()> {
@@ -222,7 +233,7 @@ pub fn chat(eng: &Engine, branch: Option<&str>, o: &Opts) -> Result<()> {
             continue;
         }
         match s.turn(input) {
-            Ok(_) => {}
+            Ok(r) => eprintln!("\n{DIM}[{} steps · {}]{OFF}", r.steps, usage_line(&r.usage)),
             Err(e) => eprintln!("\n{RED}{e:#}{OFF}\n{DIM}(the record is intact; /continue retries){OFF}"),
         }
         println!();

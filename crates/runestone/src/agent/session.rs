@@ -60,6 +60,30 @@ pub struct TurnResult {
     pub text: String,
     pub steps: usize,
     pub stop: String,
+    pub usage: Usage,
+}
+
+/// Token totals for one turn, summed over its model calls.
+#[derive(Debug, Clone, Default)]
+pub struct Usage {
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+}
+
+impl Usage {
+    fn add(&mut self, u: &Value) {
+        self.input += u["input_tokens"].as_u64().unwrap_or(0);
+        self.cache_read += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+        self.cache_write += u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+        self.output += u["output_tokens"].as_u64().unwrap_or(0);
+    }
+    /// Share of prompt tokens served from the cache.
+    pub fn cache_hit(&self) -> f64 {
+        let total = self.input + self.cache_read + self.cache_write;
+        if total == 0 { 0.0 } else { self.cache_read as f64 / total as f64 }
+    }
 }
 
 pub struct Session<'a> {
@@ -177,6 +201,7 @@ impl<'a> Session<'a> {
         let tmp = self.eng.home.join("tmp");
         let mut since_check = 0usize; // file-changing calls since the last check
         let mut dirty = false; // files changed since the last check
+        let mut usage = Usage::default();
         for step in 1..=self.max_steps {
             let chain = self.chain()?;
             let folded = fold(&self.eng.store, &chain)?;
@@ -197,6 +222,7 @@ impl<'a> Session<'a> {
                 }
             };
             self.ui.usage(&resp["usage"]);
+            usage.add(&resp["usage"]);
             let content = resp["content"].clone();
             let text: String = content
                 .as_array()
@@ -228,7 +254,7 @@ impl<'a> Session<'a> {
                         continue; // rolled back to the best state: keep working from there
                     }
                 }
-                return Ok(TurnResult { text, steps: step, stop });
+                return Ok(TurnResult { text, steps: step, stop, usage });
             }
             let mut ctx = tools::Ctx { worktree: self.eng.world.worktree.clone(), tmp: tmp.clone(), seen: folded.seen, offline: false, alias: self.eng.world.alias.clone() };
             for tu in uses {
@@ -257,7 +283,7 @@ impl<'a> Session<'a> {
             }
         }
         self.eng.record(&self.branch, "turn.end", json!({ "stop": "max_steps" }))?;
-        Ok(TurnResult { text: format!("Stopped after {} steps.", self.max_steps), steps: self.max_steps, stop: "max_steps".into() })
+        Ok(TurnResult { text: format!("Stopped after {} steps.", self.max_steps), steps: self.max_steps, stop: "max_steps".into(), usage })
     }
 
     /// Run one tool call. Returns whether it changed files.
