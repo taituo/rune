@@ -35,7 +35,7 @@ targets the last passing check.
 | Auto-rollback | After N consecutive checks worse than the best, a keep-human rewind to the best checked state, with the undone attempts listed for the model. At most 3 per request; never past an outside-world action. Abandoned branches stay in the record, and every recorded tree is pinned with a ref so git gc cannot collect them. |
 | Model | Anthropic Messages API, or any OpenAI-compatible chat/completions gateway (`--api openai --base-url …`, `rune models`). The record keeps one block format; each session renders its requests for its API deterministically, so `rune verify` holds for both. SSE streaming accumulated into the non-streaming shape (tool-call fragments, usage incl. cached tokens), retries on 429/5xx/529 and stream errors. `--model`, `--effort`, `--show-thinking`. |
 
-See [TESTING.md](TESTING.md) for how to try it with a real model, [docs/TODO.md](docs/TODO.md) for what is next, and [docs/versioned-worlds.md](docs/versioned-worlds.md) for the original idea document, and [docs/results.md](docs/results.md) for results from real-model runs.
+See [TESTING.md](TESTING.md) for how to try it with a real model, [docs/TODO.md](docs/TODO.md) for what is next ([docs/DEV-PLAN.md](docs/DEV-PLAN.md) and [docs/TEST-PLAN.md](docs/TEST-PLAN.md) for the long versions), and [docs/versioned-worlds.md](docs/versioned-worlds.md) for the original idea document, and [docs/results.md](docs/results.md) for results from real-model runs.
 
 ## Branch search (experimental)
 
