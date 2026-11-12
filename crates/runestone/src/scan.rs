@@ -15,7 +15,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// What a file looked like when it was hashed.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Stat {
     mtime: i64,
     mtime_ns: i64,
@@ -36,7 +36,36 @@ impl Stat {
 pub(crate) struct StatCache {
     loaded: bool,
     dirty: bool,
-    entries: HashMap<String, (Stat, String)>,
+    /// directory → file name → (stat when hashed, blob). Split by directory so a lookup needs no path string.
+    entries: Files,
+    /// Directory listings (non-ignored entries), reused while the directory and the rules are unchanged:
+    /// no readdir, no ignore matching (git's untracked cache does the same).
+    dirs: DirCache,
+    dirs_dirty: bool,
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct DirCache {
+    /// Fingerprint of the rules that apply everywhere (info/exclude, git config, global ignore file).
+    rules: String,
+    dirs: HashMap<String, std::sync::Arc<Listing>>,
+    /// Tree id of each directory as last built: reused when nothing in it changed.
+    #[serde(default)]
+    trees: HashMap<String, String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+struct Listing {
+    stat: Stat,
+    gitignore: Option<Stat>,
+    /// (name, is_dir)
+    entries: Vec<(String, bool)>,
+}
+
+type Files = HashMap<String, HashMap<String, (Stat, String)>>;
+
+fn file_count(f: &Files) -> usize {
+    f.values().map(|m| m.len()).sum()
 }
 
 /// Why the in-process scan declined; the caller uses git instead.
@@ -91,9 +120,17 @@ impl Rules {
 /// could otherwise keep its old stat data and hide behind the cache ("racy git").
 const RACY_SECS: i64 = 2;
 
+fn racy_secs() -> i64 {
+    std::env::var("RUNE_RACY_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(RACY_SECS)
+}
+
 impl World {
     fn stat_path(&self) -> PathBuf {
         PathBuf::from(format!("{}.stat", self.index_path.display()))
+    }
+
+    fn dirs_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}.dirs", self.index_path.display()))
     }
 
     fn load_stats(&self, cache: &mut StatCache) {
@@ -101,6 +138,9 @@ impl World {
             return;
         }
         cache.loaded = true;
+        if let Ok(bytes) = std::fs::read(self.dirs_path()) {
+            cache.dirs = serde_json::from_slice(&bytes).unwrap_or_default();
+        }
         let Ok(text) = std::fs::read_to_string(self.stat_path()) else { return };
         for line in text.lines() {
             let mut f = line.splitn(10, ' ');
@@ -110,20 +150,31 @@ impl World {
             };
             let (Some(sha), Some(path)) = (f.next(), f.next()) else { continue };
             let st = Stat { mtime: mt, mtime_ns: mtn, ctime: ct, ctime_ns: ctn, size: size as u64, ino: ino as u64, mode: mode as u32 };
-            cache.entries.insert(path.to_string(), (st, sha.to_string()));
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+            cache.entries.entry(dir.to_string()).or_default().insert(name.to_string(), (st, sha.to_string()));
         }
     }
 
     fn save_stats(&self, cache: &mut StatCache) -> Result<()> {
+        if cache.dirs_dirty {
+            let path = self.dirs_path();
+            let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
+            std::fs::write(&tmp, serde_json::to_vec(&cache.dirs)?)?;
+            std::fs::rename(&tmp, &path)?;
+            cache.dirs_dirty = false;
+        }
         if !cache.dirty {
             return Ok(());
         }
-        let mut out = String::with_capacity(cache.entries.len() * 96);
-        for (path, (s, sha)) in &cache.entries {
-            if path.contains('\n') {
-                continue;
+        let mut out = String::with_capacity(file_count(&cache.entries) * 96);
+        for (dir, files) in &cache.entries {
+            for (name, (s, sha)) in files {
+                let path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+                if path.contains('\n') {
+                    continue;
+                }
+                out += &format!("{} {} {} {} {} {} {} {sha} {path}\n", s.mtime, s.mtime_ns, s.ctime, s.ctime_ns, s.size, s.ino, s.mode);
             }
-            out += &format!("{} {} {} {} {} {} {} {sha} {path}\n", s.mtime, s.mtime_ns, s.ctime, s.ctime_ns, s.size, s.ino, s.mode);
         }
         let path = self.stat_path();
         let tmp = PathBuf::from(format!("{}.{}.tmp", path.display(), std::process::id()));
@@ -138,60 +189,91 @@ impl World {
     /// Two phases: a parallel walk (stat, look up the cache, hash what changed; subtrees spread over
     /// threads), then the tree objects bottom-up on this thread.
     pub(crate) fn scan_snapshot(&self) -> Result<String> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        let rules = Rules::new(&self.worktree, &self.git_dir.join("info/exclude"));
+        // Shift "now" back by the racy window once; comparisons below are then `>= now`.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0) - racy_secs();
+        let exclude_file = self.git_dir.join("info/exclude");
+        let rules = Rules::new(&self.worktree, &exclude_file);
+        let rules_key = rules_fingerprint(&exclude_file);
         let mut cache = self.stats.borrow_mut();
         self.load_stats(&mut cache);
-        let walker = Walker { git_dir: &self.git_dir, rules: &rules, cache: &cache.entries, now };
-        let root = walker.walk_parallel(&self.worktree)?;
+        let rules_ok = cache.dirs.rules == rules_key;
+        let walker = Walker { git_dir: &self.git_dir, rules: &rules, cache: &cache.entries, dirs: &cache.dirs.dirs, now };
+        let root = walker.walk_parallel(&self.worktree, rules_ok)?;
+        let relist = root.any_fresh() || !rules_ok;
         // Usually nothing to store: every file was a hit, or changed too recently to cache (racy). A file
         // hashed long enough after its last change is added; a cached file that is gone forces a rebuild.
         let mut n = Counts::default();
         root.count(&mut n);
-        let tree = if n.in_cache != cache.entries.len() {
+        let old_trees = std::mem::take(&mut cache.dirs.trees);
+        let mut trees = HashMap::with_capacity(old_trees.len());
+        let (tree, _) = if n.in_cache != file_count(&cache.entries) {
             let mut fresh = HashMap::with_capacity(cache.entries.len());
-            let t = self.build(&root, "", &mut Update::Fresh(&mut fresh))?;
+            let t = self.build(&root, "", &mut Update::Fresh(&mut fresh), &old_trees, &mut trees)?;
             cache.entries = fresh;
             cache.dirty = true;
             t
         } else if n.new_cacheable > 0 {
             cache.dirty = true;
-            self.build(&root, "", &mut Update::Add(&mut cache.entries))?
+            self.build(&root, "", &mut Update::Add(&mut cache.entries), &old_trees, &mut trees)?
         } else {
-            self.build(&root, "", &mut Update::None)?
+            self.build(&root, "", &mut Update::None, &old_trees, &mut trees)?
         };
+        if relist {
+            let mut dirs = HashMap::new();
+            root.listings("", &mut dirs);
+            cache.dirs.dirs = dirs;
+            cache.dirs.rules = rules_key;
+        }
+        if relist || trees != old_trees {
+            cache.dirs_dirty = true;
+        }
+        cache.dirs.trees = trees;
         self.save_stats(&mut cache)?;
         Ok(tree.unwrap_or_else(|| crate::objects::EMPTY_TREE.to_string()))
     }
 
-    fn build(&self, node: &Node, rel: &str, up: &mut Update) -> Result<Option<String>> {
+    /// The tree of `node`, and whether it is unchanged since the last build (then its id comes from
+    /// `old` and no tree object is serialized, hashed or looked up).
+    fn build(&self, node: &Node, rel: &str, up: &mut Update, old: &HashMap<String, String>, trees: &mut HashMap<String, String>) -> Result<(Option<String>, bool)> {
+        let mut clean = !node.fresh;
         let mut entries = Vec::with_capacity(node.items.len());
         for (name, item) in &node.items {
             let r = || if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
             match item {
                 Item::Dir(child) => {
-                    if let Some(sha) = self.build(child, &r(), up)? {
+                    let (sha, c) = self.build(child, &r(), up, old, trees)?;
+                    clean &= c;
+                    if let Some(sha) = sha {
                         entries.push(Entry { mode: "40000".into(), name: name.clone(), sha });
                     }
                 }
                 Item::File { mode, sha, stat, hit, .. } => {
                     match (stat, &mut *up) {
                         (Some(st), Update::Fresh(m)) => {
-                            m.insert(r(), (st.clone(), sha.clone()));
+                            m.entry(rel.to_string()).or_default().insert(name.clone(), (st.clone(), sha.clone()));
                         }
                         (Some(st), Update::Add(m)) if !hit => {
-                            m.insert(r(), (st.clone(), sha.clone()));
+                            m.entry(rel.to_string()).or_default().insert(name.clone(), (st.clone(), sha.clone()));
                         }
                         _ => {}
                     }
+                    clean &= *hit;
                     entries.push(Entry { mode: (*mode).into(), name: name.clone(), sha: sha.clone() });
                 }
             }
         }
         if entries.is_empty() {
-            return Ok(None);
+            return Ok((None, clean));
         }
-        Ok(Some(self.odb.write_tree(&mut entries)?))
+        if clean {
+            if let Some(t) = old.get(rel) {
+                trees.insert(rel.to_string(), t.clone());
+                return Ok((Some(t.clone()), true));
+            }
+        }
+        let t = self.odb.write_tree(&mut entries)?;
+        trees.insert(rel.to_string(), t.clone());
+        Ok((Some(t), false))
     }
 
     /// Make the worktree go from tree `from` (what it is now) to tree `to`, touching only what differs.
@@ -293,14 +375,18 @@ impl World {
 
 struct Node {
     items: Vec<(String, Item)>,
+    /// This directory's listing to cache (None when racy).
+    listing: Option<std::sync::Arc<Listing>>,
+    /// Read from disk this time (not reused).
+    fresh: bool,
 }
 
 enum Update<'a> {
     None,
     /// Insert the files hashed now that may be cached.
-    Add(&'a mut HashMap<String, (Stat, String)>),
+    Add(&'a mut Files),
     /// Build the whole cache anew.
-    Fresh(&'a mut HashMap<String, (Stat, String)>),
+    Fresh(&'a mut Files),
 }
 
 #[derive(Default)]
@@ -312,6 +398,22 @@ struct Counts {
 }
 
 impl Node {
+    fn any_fresh(&self) -> bool {
+        self.fresh || self.items.iter().any(|(_, it)| matches!(it, Item::Dir(d) if d.any_fresh()))
+    }
+
+    fn listings(&self, rel: &str, out: &mut HashMap<String, std::sync::Arc<Listing>>) {
+        if let Some(l) = &self.listing {
+            out.insert(rel.to_string(), l.clone());
+        }
+        for (name, it) in &self.items {
+            if let Item::Dir(d) = it {
+                let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+                d.listings(&r, out);
+            }
+        }
+    }
+
     fn count(&self, n: &mut Counts) {
         for (_, it) in &self.items {
             match it {
@@ -334,20 +436,36 @@ enum Item {
 struct Walker<'a> {
     git_dir: &'a Path,
     rules: &'a Rules,
-    cache: &'a HashMap<String, (Stat, String)>,
+    cache: &'a Files,
+    dirs: &'a HashMap<String, std::sync::Arc<Listing>>,
     now: i64,
+}
+
+/// Stats of the files that decide the rules everywhere; a change invalidates every cached listing.
+fn rules_fingerprint(exclude_file: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config"));
+    let files = [exclude_file.to_path_buf(), home.join(".gitconfig"), xdg.join("git/config"), xdg.join("git/ignore")];
+    files
+        .iter()
+        .map(|f| match std::fs::metadata(f) {
+            Ok(m) => format!("{}.{}:{}:{}", m.mtime(), m.mtime_nsec(), m.size(), m.ino()),
+            Err(_) => "-".into(),
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl Walker<'_> {
     /// Walk the root on this thread, but hand its subdirectories to a pool of threads.
-    fn walk_parallel(&self, root: &Path) -> Result<Node> {
+    fn walk_parallel(&self, root: &Path, rules_ok: bool) -> Result<Node> {
         let mut stack = Vec::new();
-        let pushed = push_gitignore(root, &mut stack);
-        let _ = pushed;
-        let (mut node, subdirs) = self.read_dir(root, "", &stack, false)?;
+        let (mut node, subdirs) = self.dir(root, "", &mut stack, rules_ok, false)?;
+        // dir() popped the root's .gitignore on return; the subdirectories still need it.
+        stack.extend(load_gitignore(root));
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
         let results: Vec<(usize, Result<Node>)> = if threads <= 1 || subdirs.len() <= 1 {
-            subdirs.iter().map(|(i, abs, rel)| (*i, self.walk(abs, rel, &mut stack.clone()))).collect()
+            subdirs.iter().map(|(i, abs, rel, ok)| (*i, self.walk(abs, rel, &mut stack.clone(), *ok))).collect()
         } else {
             let queue = std::sync::Mutex::new(subdirs.iter());
             let out = std::sync::Mutex::new(Vec::new());
@@ -355,8 +473,8 @@ impl Walker<'_> {
                 for _ in 0..threads {
                     s.spawn(|| loop {
                         let next = queue.lock().unwrap().next();
-                        let Some((i, abs, rel)) = next else { break };
-                        let r = self.walk(abs, rel, &mut stack.clone());
+                        let Some((i, abs, rel, ok)) = next else { break };
+                        let r = self.walk(abs, rel, &mut stack.clone(), *ok);
                         out.lock().unwrap().push((*i, r));
                     });
                 }
@@ -369,104 +487,178 @@ impl Walker<'_> {
         Ok(node)
     }
 
-    fn walk(&self, dir: &Path, rel: &str, stack: &mut Vec<Gitignore>) -> Result<Node> {
-        let pushed = push_gitignore(dir, stack);
-        let res = self.read_dir(dir, rel, stack, true).map(|(n, _)| n);
+    fn walk(&self, dir: &Path, rel: &str, stack: &mut Vec<Gitignore>, rules_ok: bool) -> Result<Node> {
+        self.dir(dir, rel, stack, rules_ok, true).map(|(n, _)| n)
+    }
+
+    /// One directory. `rules_ok`: no rule that applies here changed since the cached listings were made.
+    /// With `recurse`, subdirectories are walked here; otherwise they are returned (index into items,
+    /// abs, rel, rules_ok) with a placeholder for the caller to fill.
+    #[allow(clippy::type_complexity)]
+    fn dir(&self, dir: &Path, rel: &str, stack: &mut Vec<Gitignore>, rules_ok: bool, recurse: bool) -> Result<(Node, Vec<(usize, PathBuf, String, bool)>)> {
+        let dstat = Stat::of(&std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?);
+        let gi_path = dir.join(".gitignore");
+        let gi_stat = std::fs::symlink_metadata(&gi_path).ok().filter(|m| m.is_file()).map(|m| Stat::of(&m));
+        let cached = self.dirs.get(rel);
+        // Rules below stay valid if ours did and this directory's .gitignore is the one we knew.
+        let child_ok = rules_ok && cached.map_or(gi_stat.is_none(), |c| c.gitignore == gi_stat);
+        let racy = dstat.mtime >= self.now || dstat.ctime >= self.now;
+        let reuse = cached.filter(|c| rules_ok && !racy && c.stat == dstat && c.gitignore == gi_stat).cloned();
+
+        let pushed = gi_stat.is_some() && {
+            let gi = load_gitignore(dir);
+            let some = gi.is_some();
+            stack.extend(gi);
+            some
+        };
+        let res = self.entries(dir, rel, stack, child_ok, recurse, reuse.as_deref());
         if pushed {
             stack.pop();
         }
-        res
+        let (mut node, subdirs, listing) = res?;
+        node.fresh = reuse.is_none();
+        node.listing = match reuse {
+            Some(l) => Some(l),
+            None if !racy => Some(std::sync::Arc::new(Listing { stat: dstat, gitignore: gi_stat, entries: listing })),
+            None => None,
+        };
+        Ok((node, subdirs))
     }
 
-    /// Entries of one directory. With `recurse`, subdirectories are walked here; otherwise they are
-    /// returned (index into items, abs, rel) with a placeholder for the caller to fill.
     #[allow(clippy::type_complexity)]
-    fn read_dir(&self, dir: &Path, rel: &str, stack: &[Gitignore], recurse: bool) -> Result<(Node, Vec<(usize, PathBuf, String)>)> {
-        let mut items = Vec::new();
-        let mut subdirs = Vec::new();
-        for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
-            let e = e?;
-            let name = match e.file_name().into_string() {
-                Ok(n) => n,
-                Err(n) => return Err(Unsupported(format!("non-UTF-8 name {n:?}")).into()),
-            };
-            if name == ".git" {
-                if rel.is_empty() {
-                    continue; // the project's own repository
-                }
-                return Err(Unsupported(format!("embedded repository at {rel}")).into());
-            }
-            let Ok(ft) = e.file_type() else { continue };
-            let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            let abs = e.path();
-            if ft.is_dir() {
-                if self.rules.ignored(stack, &abs, &r, true) {
-                    continue;
-                }
-                if recurse {
-                    let mut st = stack.to_vec();
-                    items.push((name, Item::Dir(self.walk(&abs, &r, &mut st)?)));
-                } else {
-                    subdirs.push((items.len(), abs, r));
-                    items.push((name, Item::Dir(Node { items: Vec::new() })));
-                }
-            } else if ft.is_file() || ft.is_symlink() {
-                if self.rules.ignored(stack, &abs, &r, false) {
-                    continue;
-                }
-                let Ok(m) = e.metadata() else { continue }; // vanished while we walked
-                let st = Stat::of(&m);
-                let entry = self.cache.get(&r);
-                let in_cache = entry.is_some();
-                let cached = entry.filter(|(s, _)| *s == st).map(|(_, sha)| sha.clone());
-                let hit = cached.is_some();
-                let sha = match cached {
-                    Some(sha) => sha,
-                    None => {
-                        let data = if ft.is_symlink() {
-                            std::fs::read_link(&abs)?.into_os_string().into_encoded_bytes()
-                        } else {
-                            match std::fs::read(&abs) {
-                                Ok(d) => d,
-                                Err(_) if !abs.exists() => continue,
-                                Err(err) => return Err(err).with_context(|| format!("read {}", abs.display())),
-                            }
-                        };
-                        crate::objects::write_loose(self.git_dir, "blob", &data)?
+    fn entries(
+        &self,
+        dir: &Path,
+        rel: &str,
+        stack: &mut Vec<Gitignore>,
+        child_ok: bool,
+        recurse: bool,
+        reuse: Option<&Listing>,
+    ) -> Result<(Node, Vec<(usize, PathBuf, String, bool)>, Vec<(String, bool)>)> {
+        // The names to look at: the cached listing, or a fresh readdir filtered by the rules.
+        let names: Vec<(String, bool)> = match reuse {
+            Some(l) => l.entries.clone(),
+            None => {
+                let mut v = Vec::new();
+                for e in std::fs::read_dir(dir).with_context(|| format!("read {}", dir.display()))? {
+                    let e = e?;
+                    let name = match e.file_name().into_string() {
+                        Ok(n) => n,
+                        Err(n) => return Err(Unsupported(format!("non-UTF-8 name {n:?}")).into()),
+                    };
+                    if name == ".git" {
+                        if rel.is_empty() {
+                            continue; // the project's own repository
+                        }
+                        return Err(Unsupported(format!("embedded repository at {rel}")).into());
                     }
-                };
-                let racy = st.mtime >= self.now - RACY_SECS || st.ctime >= self.now - RACY_SECS;
-                let mode = if ft.is_symlink() {
-                    "120000"
-                } else if m.mode() & 0o100 != 0 {
-                    "100755"
-                } else {
-                    "100644"
-                };
-                items.push((name, Item::File { mode, sha, stat: (!racy).then_some(st), hit, in_cache }));
+                    let Ok(ft) = e.file_type() else { continue };
+                    let is_dir = ft.is_dir();
+                    if !is_dir && !ft.is_file() && !ft.is_symlink() {
+                        continue; // sockets, fifos, devices: git skips them too
+                    }
+                    let r = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+                    if self.rules.ignored(stack, &e.path(), &r, is_dir) {
+                        continue;
+                    }
+                    v.push((name, is_dir));
+                }
+                v
             }
-            // sockets, fifos, devices: git skips them too
+        };
+        let mut items = Vec::with_capacity(names.len());
+        let mut subdirs = Vec::new();
+        let dcache = self.cache.get(rel);
+        // stat relative to the directory: no path resolution per file.
+        let dfd = std::fs::File::open(dir).with_context(|| format!("open {}", dir.display()))?;
+        let rel_of = |name: &str| if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+        for (name, is_dir) in &names {
+            if *is_dir {
+                let (r, abs) = (rel_of(name), dir.join(name));
+                if recurse {
+                    let mut st = stack.clone();
+                    items.push((name.clone(), Item::Dir(self.walk(&abs, &r, &mut st, child_ok)?)));
+                } else {
+                    subdirs.push((items.len(), abs, r, child_ok));
+                    items.push((name.clone(), Item::Dir(Node { items: Vec::new(), listing: None, fresh: false })));
+                }
+                continue;
+            }
+            let Some((st, kind)) = stat_at(&dfd, name) else { continue }; // vanished while we walked
+            let abs = || dir.join(name);
+            if kind == libc::S_IFDIR {
+                // Replaced by a directory since the listing was cached (the parent's mtime would normally
+                // have changed); walk it with fresh rules.
+                items.push((name.clone(), Item::Dir(self.walk(&abs(), &rel_of(name), &mut stack.clone(), false)?)));
+                continue;
+            }
+            if kind != libc::S_IFREG && kind != libc::S_IFLNK {
+                continue;
+            }
+            let is_link = kind == libc::S_IFLNK;
+            let entry = dcache.and_then(|m| m.get(name.as_str()));
+            let in_cache = entry.is_some();
+            let cached = entry.filter(|(s, _)| *s == st).map(|(_, sha)| sha.clone());
+            let hit = cached.is_some();
+            let sha = match cached {
+                Some(sha) => sha,
+                None => {
+                    let abs = abs();
+                    let data = if is_link {
+                        std::fs::read_link(&abs)?.into_os_string().into_encoded_bytes()
+                    } else {
+                        match std::fs::read(&abs) {
+                            Ok(d) => d,
+                            Err(_) if !abs.exists() => continue,
+                            Err(err) => return Err(err).with_context(|| format!("read {}", abs.display())),
+                        }
+                    };
+                    crate::objects::write_loose(self.git_dir, "blob", &data)?
+                }
+            };
+            let racy = st.mtime >= self.now || st.ctime >= self.now;
+            let mode = if is_link {
+                "120000"
+            } else if st.mode & 0o100 != 0 {
+                "100755"
+            } else {
+                "100644"
+            };
+            items.push((name.clone(), Item::File { mode, sha, stat: (!racy).then_some(st), hit, in_cache }));
         }
-        Ok((Node { items }, subdirs))
+        Ok((Node { items, listing: None, fresh: false }, subdirs, names))
     }
 }
 
-/// Push `dir`'s .gitignore onto the stack if it has one; true when pushed.
-fn push_gitignore(dir: &Path, stack: &mut Vec<Gitignore>) -> bool {
-    match std::fs::metadata(dir.join(".gitignore")) {
-        Ok(m) if m.is_file() => {
-            let mut b = GitignoreBuilder::new(dir);
-            let _ = b.add(dir.join(".gitignore"));
-            match b.build() {
-                Ok(gi) if !gi.is_empty() => {
-                    stack.push(gi);
-                    true
-                }
-                _ => false,
-            }
-        }
-        _ => false,
+/// lstat of `name` inside the open directory: (stat, file type bits).
+fn stat_at(dir: &std::fs::File, name: &str) -> Option<(Stat, libc::mode_t)> {
+    use std::os::fd::AsRawFd;
+    let c = std::ffi::CString::new(name).ok()?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatat(dir.as_raw_fd(), c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return None;
     }
+    let stat = Stat {
+        mtime: st.st_mtime,
+        mtime_ns: st.st_mtime_nsec,
+        ctime: st.st_ctime,
+        ctime_ns: st.st_ctime_nsec,
+        size: st.st_size as u64,
+        ino: st.st_ino,
+        mode: st.st_mode,
+    };
+    Some((stat, st.st_mode & libc::S_IFMT))
+}
+
+/// The directory's .gitignore, if it has a non-empty one.
+fn load_gitignore(dir: &Path) -> Option<Gitignore> {
+    let f = dir.join(".gitignore");
+    if !f.is_file() {
+        return None;
+    }
+    let mut b = GitignoreBuilder::new(dir);
+    let _ = b.add(&f);
+    b.build().ok().filter(|gi| !gi.is_empty())
 }
 
 fn current_umask() -> u32 {

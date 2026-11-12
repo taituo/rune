@@ -63,7 +63,11 @@ design notes doc ("rune: design notes, deep pass").
 - [x] Write git objects and trees in-process for layered worlds (own zlib + SHA-1 object writer, tree
       rebuild of changed directories only, in-process diff and gitignore). 0 git subprocesses per event;
       26 ms per step vs 101 ms on the scan world (20k files, 2 cores).
-- [ ] Same for the scan world (`git add -A` + `write-tree` still spawn per event), e.g. stat-cache + own index.
+- [x] Same for the scan world (M3.1): stat cache, cached directory listings and tree ids, parallel walk,
+      in-process checkout. 17–20 ms warm on 20k files (git 46–56 ms).
+- [ ] Global excludes are fingerprinted by the stats of ~/.gitconfig, $XDG_CONFIG_HOME/git/{config,ignore}
+      and info/exclude; a core.excludesFile elsewhere that changes on its own is not noticed until a
+      directory changes.
 - [ ] Base materialization dominates search start (0.6–5 s for 20k files, I/O-bound and noisy): reuse bases
       across searches, or populate lazily.
 - [x] Incremental fold: per-branch cache, only new events folded; full refold on rewind. 16 ms/step at

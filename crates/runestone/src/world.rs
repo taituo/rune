@@ -174,8 +174,25 @@ impl World {
     }
 
     /// `git add -A` + `write-tree` through the shadow index: the reference the in-process scan matches.
+    ///
+    /// One deliberate difference from plain git: a snapshot depends only on what is on disk and the
+    /// ignore rules now. Git keeps a file tracked after a rule starts ignoring it; rune drops it, so the
+    /// same files and rules always give the same tree, whatever was snapshotted before.
     pub fn git_snapshot(&self) -> Result<String> {
         self.git(&["add", "-A", "--ignore-errors", "."]).or_else(|_| self.git(&["add", "-A", "."]))?;
+        let ignored = self.git(&["ls-files", "-z", "-c", "-i", "--exclude-standard"])?;
+        if !ignored.is_empty() {
+            use std::io::Write;
+            let mut child = self
+                .cmd(&self.index(), &self.worktree)
+                .args(["update-index", "--force-remove", "-z", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+            child.stdin.take().unwrap().write_all(ignored.as_bytes())?;
+            if !child.wait()?.success() {
+                bail!("git update-index --force-remove failed");
+            }
+        }
         Ok(self.git(&["write-tree"])?.trim().to_string())
     }
 

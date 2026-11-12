@@ -62,9 +62,16 @@ slower on big trees (≈0.6 s per attempt for 20k files) and shell commands only
 Measured (2-core VM, 20k-file tree, 10 steps per attempt): layered snapshots equal a full scan (tested,
 including deletions, replaced directories, ignored files, modes and symlinks); a fork mounts in 2–40 ms;
 and since objects, trees, diffs and ignore rules are handled in-process, a layered event spawns no git
-process: 26 ms per step vs 101 ms on the scan world with one attempt, 88 ms per step with 16 attempts on
-2 cores (≈160 steps/s in aggregate once the base exists). Materializing the base tree (0.6–5 s for 20k files)
-now dominates a search's start.
+process: 26 ms per step, 88 ms per step with 16 attempts on 2 cores (≈160 steps/s in aggregate once the
+base exists). Materializing the base tree (0.6–5 s for 20k files) now dominates a search's start.
+
+The plain (scan) world is in-process too: a snapshot stats files against a persistent stat cache, reuses
+directory listings (no readdir or ignore matching for unchanged directories) and tree ids of unchanged
+directories, and hashes only what changed, in parallel. 20k files: 17–20 ms warm (git add + write-tree:
+46–56 ms), 34 ms in a fresh process, ≈55 ms per agent step (was 101). Same tree ids as git (property test);
+an embedded repository or a non-UTF-8 name falls back to git, as does `RUNE_GIT_SCAN=1`. One deliberate
+difference from git: a file that becomes ignored leaves the snapshot, so a tree depends only on the files
+and the rules, not on history.
 
 ## Measurement (`rune eval`)
 

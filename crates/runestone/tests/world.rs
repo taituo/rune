@@ -477,3 +477,53 @@ fn checkout_moves_between_trees_in_process() {
     assert_eq!(eng.world.snapshot().unwrap(), b);
     assert!(!p.join("d").exists(), "emptied directories are pruned");
 }
+
+#[test]
+fn cached_directory_listings_follow_adds_removes_and_rule_changes() {
+    // Listings are cached only for directories untouched for a while; wait it out (1 s window here).
+    std::env::set_var("RUNE_RACY_SECS", "0");
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let p = wt.path();
+    for d in ["a", "a/b", "c"] {
+        fs::create_dir_all(p.join(d)).unwrap();
+        for f in ["x.txt", "y.log", "z.rs"] {
+            fs::write(p.join(d).join(f), d).unwrap();
+        }
+    }
+    fs::write(p.join("a/.gitignore"), "*.log\n").unwrap();
+    let eng = Engine::open_in(home.path(), p).unwrap();
+    let settle = || std::thread::sleep(std::time::Duration::from_millis(1100));
+    let check = |what: &str| {
+        let ours = eng.world.snapshot().unwrap();
+        let git = eng.world.git_snapshot().unwrap();
+        if ours != git {
+            eprintln!("{}", eng.world.git(&["diff-tree", "-r", "--name-status", &git, &ours]).unwrap());
+        }
+        assert_eq!(ours, git, "{what}");
+        assert_eq!(eng.world.snapshot().unwrap(), ours, "{what} (again, from the cache)");
+    };
+    settle();
+    check("start");
+    settle();
+    check("listings cached");
+    fs::write(p.join("a/b/new.txt"), "n").unwrap();
+    settle();
+    check("file added in a cached directory");
+    fs::remove_file(p.join("c/z.rs")).unwrap();
+    settle();
+    check("file removed");
+    fs::write(p.join("a/.gitignore"), "*.log\n*.rs\n").unwrap();
+    settle();
+    check("nested .gitignore changed (applies to a/b too)");
+    fs::write(eng.world.git_dir.join("info/exclude"), "*.txt\n").unwrap();
+    settle();
+    check("info/exclude changed");
+    fs::remove_dir_all(p.join("a/b")).unwrap();
+    fs::write(p.join("a/b"), "now a file").unwrap();
+    settle();
+    check("directory replaced by a file");
+    // A fresh engine reads the persisted listings.
+    let again = Engine::open_in(home.path(), p).unwrap();
+    assert_eq!(again.world.snapshot().unwrap(), eng.world.git_snapshot().unwrap());
+}

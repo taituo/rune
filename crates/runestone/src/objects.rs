@@ -173,7 +173,7 @@ impl Odb {
 
     /// Write a tree in git's canonical order (directories sort as if their name ended in '/').
     pub fn write_tree(&self, entries: &mut [Entry]) -> Result<String> {
-        entries.sort_by(|a, b| sort_key(a).cmp(&sort_key(b)));
+        entries.sort_by(|a, b| tree_order(a).cmp(tree_order(b)));
         let mut data = Vec::new();
         for e in entries.iter() {
             data.extend_from_slice(e.mode.as_bytes());
@@ -257,12 +257,9 @@ impl Odb {
     }
 }
 
-fn sort_key(e: &Entry) -> Vec<u8> {
-    let mut k = e.name.as_bytes().to_vec();
-    if e.is_tree() {
-        k.push(b'/');
-    }
-    k
+/// Git's tree order: names compared as bytes, a directory as if its name ended in '/'. No allocation.
+fn tree_order(e: &Entry) -> impl Iterator<Item = u8> + '_ {
+    e.name.bytes().chain(e.is_tree().then_some(b'/'))
 }
 
 fn is_binary(b: &[u8]) -> bool {
