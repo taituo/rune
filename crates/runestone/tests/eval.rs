@@ -60,6 +60,8 @@ fn git(dir: &Path, args: &[&str]) {
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null") // hermetic: no signing hooks or user config
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@t")
         .env("GIT_COMMITTER_NAME", "t")
