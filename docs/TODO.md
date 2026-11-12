@@ -33,6 +33,8 @@ design notes doc ("rune: design notes, deep pass").
 - [x] `rune eval mine --validate`: keep only tasks whose hidden tests fail at the base and pass at the commit.
 - [x] Offline runs (checks, dry-mode Bash) keep loopback up, so mock-server tests pass offline (found by
       --validate: two of rune's own tasks failed at their commit because 127.0.0.1 was down).
+- [x] Checks score the starting state of each turn (baseline), so the first bad edit can roll back
+      (`--rollback-after 1` in TESTING step 4 never fired without it; found in the pilot run).
 - [x] Concurrent `Store::open` no longer fails with "database is locked" (opens take turns on a lock file).
 - [x] Shared cargo target dir for eval cells and validations (`$RUNE_HOME/cache/cargo-target`, unless CARGO_TARGET_DIR is set).
 - [ ] Spread over runs per cell in the report; per-task links into the record (branch ids are in report.json).

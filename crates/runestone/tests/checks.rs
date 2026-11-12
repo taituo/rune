@@ -132,7 +132,42 @@ fn no_rollback_without_a_regression() {
     s.turn("go").unwrap();
     let lin = eng.lineage(&b).unwrap();
     assert!(!lin.iter().any(|e| e.kind == "world.rewind"));
-    assert_eq!(lin.iter().filter(|e| e.kind == "check").count(), 2);
+    assert_eq!(lin.iter().filter(|e| e.kind == "check").count(), 3, "baseline + one per edit");
+}
+
+#[test]
+fn the_first_edit_can_roll_back_against_the_baseline() {
+    // The start already scores 2; the very first edit makes it worse. Without a baseline check there would
+    // be nothing to compare against (found in the trap fixture with --rollback-after 1).
+    let (_h, wt, eng) = setup();
+    fs::write(wt.path().join("results.txt"), "ok\nok\n").unwrap();
+    let script = Rc::new(Scripted::new(vec![
+        msg(vec![tool_use("r1", "Read", json!({ "file_path": "results.txt" }))]),
+        msg(vec![tool_use("w1", "Write", json!({ "file_path": "results.txt", "content": "ok\nbad\n" }))]),
+        msg(vec![text("after rollback")]),
+    ]));
+    let b = eng.branch("s/base");
+    Session::spawn(&eng, &b, &Config::default(), "2026-11-12").unwrap();
+    let mut s = Session {
+        eng: &eng,
+        branch: b.clone(),
+        provider: Box::new(Shared(script.clone())),
+        ui: Box::new(Quiet),
+        perm: Permission::Dry,
+        max_steps: 20,
+        checks: Some(Checks { cmd: SCORE_SH.into(), every: 1, rollback_after: 1, timeout: Duration::from_secs(30) }),
+    };
+    s.turn("go").unwrap();
+    let lin = eng.lineage(&b).unwrap();
+    assert!(lin.iter().any(|e| e.kind == "world.rewind" && e.body["auto"] == json!(true)), "rolled back");
+    assert_eq!(fs::read_to_string(wt.path().join("results.txt")).unwrap(), "ok\nok\n");
+    // A second turn on the same tree does not re-run the baseline.
+    let n = |l: &[runestone::store::Event]| l.iter().filter(|e| e.kind == "check").count();
+    let before = n(&lin);
+    let script2 = Rc::new(Scripted::new(vec![msg(vec![text("nothing")])]));
+    s.provider = Box::new(Shared(script2));
+    s.turn("again").unwrap();
+    assert_eq!(n(&eng.lineage(&b).unwrap()), before);
 }
 
 #[test]

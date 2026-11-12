@@ -260,7 +260,24 @@ impl<'a> Session<'a> {
         if let Some(n) = ev.str("note") {
             self.ui.note(n);
         }
+        self.baseline_check()?;
         self.run_loop()
+    }
+
+    /// With checks on, score the starting state of a turn (unless the last check already scored this exact
+    /// tree). Without a baseline, the first edit has nothing to be worse than, so a regression on the very
+    /// first try could never roll back.
+    fn baseline_check(&mut self) -> Result<()> {
+        if self.checks.is_none() {
+            return Ok(());
+        }
+        let tree = self.eng.world.snapshot()?;
+        let chain = self.chain()?;
+        if chain.iter().rev().find(|e| e.kind == "check").and_then(|e| e.str("tree")) == Some(tree.as_str()) {
+            return Ok(());
+        }
+        self.run_check()?;
+        Ok(())
     }
 
     /// Continue from the current head (after a crash, or after a rewind the human applied).
