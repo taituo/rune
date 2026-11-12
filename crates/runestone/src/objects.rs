@@ -42,6 +42,39 @@ pub struct Odb {
     trees: RefCell<HashMap<String, std::rc::Rc<Vec<Entry>>>>,
 }
 
+/// Write a loose object (no shared state: safe from several threads at once).
+pub(crate) fn write_loose(git_dir: &Path, kind: &str, data: &[u8]) -> Result<String> {
+    let sha = object_id(kind, data);
+    if kind == "tree" && sha == EMPTY_TREE {
+        return Ok(sha);
+    }
+    let path = git_dir.join("objects").join(&sha[..2]).join(&sha[2..]);
+    if path.exists() {
+        return Ok(sha);
+    }
+    let dir = path.parent().unwrap();
+    std::fs::create_dir_all(dir)?;
+    // Mode 0444 from the start, like git: no separate chmod.
+    let mut enc = ZlibEncoder::new(Vec::with_capacity(data.len() / 2 + 64), flate2::Compression::fast());
+    enc.write_all(format!("{kind} {}\0", data.len()).as_bytes())?;
+    enc.write_all(data)?;
+    let bytes = enc.finish()?;
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir.join(format!("tmp_obj_{}_{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o444).open(&tmp)?;
+        f.write_all(&bytes)?;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        if !path.exists() {
+            bail!("could not write object {sha}");
+        }
+    }
+    Ok(sha)
+}
+
 pub fn object_id(kind: &str, data: &[u8]) -> String {
     let mut h = Sha1::new();
     h.update(format!("{kind} {}\0", data.len()).as_bytes());
@@ -59,35 +92,7 @@ impl Odb {
     }
 
     pub fn write(&self, kind: &str, data: &[u8]) -> Result<String> {
-        let sha = object_id(kind, data);
-        if kind == "tree" && sha == EMPTY_TREE {
-            return Ok(sha);
-        }
-        let path = self.loose_path(&sha);
-        if path.exists() {
-            return Ok(sha);
-        }
-        let dir = path.parent().unwrap();
-        std::fs::create_dir_all(dir)?;
-        let mut enc = ZlibEncoder::new(Vec::with_capacity(data.len() / 2 + 64), flate2::Compression::fast());
-        enc.write_all(format!("{kind} {}\0", data.len()).as_bytes())?;
-        enc.write_all(data)?;
-        let bytes = enc.finish()?;
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tmp = dir.join(format!("tmp_obj_{}_{}", std::process::id(), SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-        std::fs::write(&tmp, &bytes)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o444));
-        }
-        if std::fs::rename(&tmp, &path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            if !path.exists() {
-                bail!("could not write object {sha}");
-            }
-        }
-        Ok(sha)
+        write_loose(&self.git_dir, kind, data)
     }
 
     pub fn write_blob_file(&self, path: &Path) -> Result<String> {

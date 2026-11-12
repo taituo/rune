@@ -143,6 +143,7 @@ impl World {
             index_path: parent.git_dir.join(format!("index.layer.{key}")),
             layer: Some(LayerRef { base_tree: layer.base_tree.clone(), upper: layer.upper.clone() }),
             hashes: Default::default(),
+            stats: Default::default(),
             alias: Some(parent.worktree.clone()),
             odb: crate::objects::Odb::new(&parent.git_dir),
         })
@@ -248,14 +249,16 @@ impl World {
 
 /// .gitignore matching in-process: rune's excludes, then each ancestor directory's .gitignore, the
 /// deepest one deciding (as git does).
-struct Ignores {
+pub(crate) struct Ignores {
     root: PathBuf,
     exclude: Option<ignore::gitignore::Gitignore>,
+    /// core.excludesFile (or ~/.config/git/ignore): git applies it to the shadow repo too.
+    global: Option<ignore::gitignore::Gitignore>,
     dirs: std::collections::HashMap<String, Option<ignore::gitignore::Gitignore>>,
 }
 
 impl Ignores {
-    fn new(root: &Path, exclude_file: &Path) -> Self {
+    pub(crate) fn new(root: &Path, exclude_file: &Path) -> Self {
         let mut b = ignore::gitignore::GitignoreBuilder::new(root);
         for pat in crate::world::DEFAULT_EXCLUDES {
             let _ = b.add_line(None, pat);
@@ -263,7 +266,9 @@ impl Ignores {
         if exclude_file.exists() {
             let _ = b.add(exclude_file);
         }
-        Ignores { root: root.to_path_buf(), exclude: b.build().ok(), dirs: Default::default() }
+        let (global, _) = ignore::gitignore::Gitignore::global();
+        let global = (!global.is_empty()).then_some(global);
+        Ignores { root: root.to_path_buf(), exclude: b.build().ok(), global, dirs: Default::default() }
     }
 
     fn matcher(&mut self, dir: &str) -> Option<&ignore::gitignore::Gitignore> {
@@ -283,12 +288,17 @@ impl Ignores {
     }
 
     fn ignored(&mut self, rel: &str) -> bool {
+        self.ignored_as(rel, false)
+    }
+
+    /// Git's precedence: .gitignore files (deepest first), then info/exclude, then the global file.
+    pub(crate) fn ignored_as(&mut self, rel: &str, is_dir: bool) -> bool {
         let full = self.root.join(rel);
         let comps: Vec<&str> = rel.split('/').collect();
         for depth in (0..comps.len()).rev() {
             let dir = comps[..depth].join("/");
             if let Some(gi) = self.matcher(&dir) {
-                let m = gi.matched_path_or_any_parents(&full, false);
+                let m = gi.matched_path_or_any_parents(&full, is_dir);
                 if m.is_ignore() {
                     return true;
                 }
@@ -297,8 +307,15 @@ impl Ignores {
                 }
             }
         }
-        match &self.exclude {
-            Some(gi) => gi.matched_path_or_any_parents(&full, false).is_ignore(),
+        if let Some(gi) = &self.exclude {
+            let m = gi.matched_path_or_any_parents(&full, is_dir);
+            if m.is_ignore() || m.is_whitelist() {
+                return m.is_ignore();
+            }
+        }
+        // The global matcher has no root; match the path relative to the worktree.
+        match &self.global {
+            Some(gi) => gi.matched_path_or_any_parents(Path::new(rel), is_dir).is_ignore(),
             None => false,
         }
     }
@@ -350,6 +367,7 @@ impl Engine {
             index_path: index,
             layer: None,
             hashes: Default::default(),
+            stats: Default::default(),
             alias: Some(parent.world.worktree.clone()),
             odb: crate::objects::Odb::new(&parent.world.git_dir),
         };

@@ -65,6 +65,8 @@ pub struct World {
     pub(crate) layer: Option<crate::layer::LayerRef>,
     /// path -> (mtime, size, mode, blob) so unchanged upper files are not re-hashed.
     pub(crate) hashes: std::cell::RefCell<std::collections::HashMap<PathBuf, (std::time::SystemTime, u64, u32, String)>>,
+    /// Stat cache for in-process scans of a plain worktree (persisted next to the index).
+    pub(crate) stats: std::cell::RefCell<crate::scan::StatCache>,
     /// The path the agent should see instead of `worktree` (a fork shows the main worktree's path).
     pub alias: Option<PathBuf>,
     /// In-process object store (no git subprocess for hashing, trees, diffs).
@@ -79,7 +81,7 @@ impl World {
         let git_dir = home.join("repos").join(&key);
         let index_path = git_dir.join("index");
         let odb = crate::objects::Odb::new(&git_dir);
-        let w = World { worktree, git_dir, key, index_path, layer: None, hashes: Default::default(), alias: None, odb };
+        let w = World { worktree, git_dir, key, index_path, layer: None, hashes: Default::default(), stats: Default::default(), alias: None, odb };
         if !w.git_dir.join("HEAD").exists() {
             let _l = w.lock()?;
             if !w.git_dir.join("HEAD").exists() {
@@ -161,6 +163,18 @@ impl World {
     }
 
     fn snapshot_locked(&self) -> Result<String> {
+        if std::env::var_os("RUNE_GIT_SCAN").is_none() {
+            match self.scan_snapshot() {
+                Ok(t) => return Ok(t),
+                Err(e) if e.downcast_ref::<crate::scan::Unsupported>().is_some() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.git_snapshot()
+    }
+
+    /// `git add -A` + `write-tree` through the shadow index: the reference the in-process scan matches.
+    pub fn git_snapshot(&self) -> Result<String> {
         self.git(&["add", "-A", "--ignore-errors", "."]).or_else(|_| self.git(&["add", "-A", "."]))?;
         Ok(self.git(&["write-tree"])?.trim().to_string())
     }
@@ -242,17 +256,10 @@ impl World {
     /// written fresh, so their mtimes are "now": build tools see restored sources as newer than old
     /// artifacts and rebuild. Excluded paths are never touched.
     pub fn checkout(&self, tree: &str) -> Result<String> {
-        if self.layer.is_some() {
-            let live = self.snapshot()?;
-            if live != tree {
-                self.git(&["read-tree", "-m", "-u", &live, tree])?;
-            }
-            return Ok(live);
-        }
-        let _l = self.lock()?;
-        let live = self.snapshot_locked()?;
+        let _l = if self.layer.is_none() { Some(self.lock()?) } else { None };
+        let live = if self.layer.is_some() { self.layered_snapshot()? } else { self.snapshot_locked()? };
         if live != tree {
-            self.git(&["read-tree", "-m", "-u", &live, tree])?;
+            self.apply_tree(&live, tree)?;
         }
         Ok(live)
     }

@@ -342,3 +342,138 @@ fn two_sessions_in_one_worktree_do_not_collide() {
     });
     assert_eq!(errors.load(std::sync::atomic::Ordering::Relaxed), 0, "concurrent snapshots failed");
 }
+
+/// Tiny deterministic RNG for the property test.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 >> 33
+    }
+    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+        &xs[(self.next() as usize) % xs.len()]
+    }
+}
+
+#[test]
+fn in_process_scan_matches_git_add_write_tree() {
+    use std::os::unix::fs::PermissionsExt;
+    const DIRS: &[&str] = &["", "src", "src/deep/er", "docs", "target", "node_modules/x", "logs", "a b", "ünï", "keep", "build/out"];
+    const NAMES: &[&str] = &["a.txt", "main.rs", "x.log", ".env.local", "run.sh", "data.db", "ok.keep", "README", "space name.md", "ä.txt", "empty"];
+    for seed in 1..=12u64 {
+        let mut r = Lcg(seed);
+        let home = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        let p = wt.path();
+        fs::write(p.join(".gitignore"), "*.log\n/logs/\n!keep/*.log\nbuild/\n").unwrap();
+        fs::create_dir_all(p.join("src")).unwrap();
+        fs::write(p.join("src/.gitignore"), "*.tmp\n!important.tmp\n").unwrap();
+        fs::create_dir_all(p.join("empty-dir/inner")).unwrap();
+        let eng = Engine::open_in(home.path(), p).unwrap();
+        for round in 0..6 {
+            for _ in 0..25 {
+                let d = r.pick(DIRS).to_string();
+                let n = r.pick(NAMES).to_string();
+                let rel = if d.is_empty() { n.clone() } else { format!("{d}/{n}") };
+                let abs = p.join(&rel);
+                fs::create_dir_all(abs.parent().unwrap()).unwrap();
+                match r.next() % 7 {
+                    0 => {
+                        let _ = fs::remove_file(&abs);
+                    }
+                    1 => {
+                        let _ = fs::remove_file(&abs);
+                        let target = if r.next() % 2 == 0 { "a.txt" } else { "../missing" };
+                        let _ = std::os::unix::fs::symlink(target, &abs);
+                    }
+                    2 if abs.is_file() => {
+                        let mode = if r.next() % 2 == 0 { 0o755 } else { 0o644 };
+                        fs::set_permissions(&abs, fs::Permissions::from_mode(mode)).unwrap();
+                    }
+                    3 => {
+                        let _ = fs::remove_file(&abs);
+                        fs::write(&abs, "").unwrap();
+                    }
+                    _ => {
+                        if fs::symlink_metadata(&abs).map(|m| m.file_type().is_symlink()).unwrap_or(false) {
+                            fs::remove_file(&abs).unwrap();
+                        }
+                        // Same size rewrite in the same second: only content changes.
+                        fs::write(&abs, format!("round {round} {}\n", r.next() % 10)).unwrap();
+                    }
+                }
+            }
+            fs::write(p.join("src/x.tmp"), "t").unwrap();
+            fs::write(p.join("src/important.tmp"), format!("{round}")).unwrap();
+            let ours = eng.world.snapshot().unwrap();
+            let git = eng.world.git_snapshot().unwrap();
+            assert_eq!(ours, git, "seed {seed} round {round}");
+            // Again from the cache, without changes.
+            assert_eq!(eng.world.snapshot().unwrap(), git, "seed {seed} round {round} (cached)");
+        }
+    }
+}
+
+#[test]
+fn stat_cache_survives_processes_and_sees_same_size_rewrites() {
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    for i in 0..50 {
+        fs::write(wt.path().join(format!("f{i}.txt")), format!("{i:03}\n")).unwrap();
+    }
+    // Age the files past the racy window so they are cached.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    for i in 0..50 {
+        let f = fs::File::options().write(true).open(wt.path().join(format!("f{i}.txt"))).unwrap();
+        f.set_modified(old).unwrap();
+    }
+    let t1 = Engine::open_in(home.path(), wt.path()).unwrap().world.snapshot().unwrap();
+    // A new engine (a new process in hook mode) reads the persisted cache.
+    let eng = Engine::open_in(home.path(), wt.path()).unwrap();
+    assert_eq!(eng.world.snapshot().unwrap(), t1);
+    // Same size, mtime forced back to the cached value: ctime still differs, so it is re-hashed.
+    let f = wt.path().join("f7.txt");
+    fs::write(&f, "777\n").unwrap();
+    fs::File::options().write(true).open(&f).unwrap().set_modified(old).unwrap();
+    let t2 = eng.world.snapshot().unwrap();
+    assert_ne!(t2, t1);
+    assert_eq!(t2, eng.world.git_snapshot().unwrap());
+}
+
+#[test]
+fn checkout_moves_between_trees_in_process() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let wt = tempfile::tempdir().unwrap();
+    let p = wt.path();
+    fs::create_dir_all(p.join("d/e")).unwrap();
+    fs::write(p.join("d/e/f.txt"), "f\n").unwrap();
+    fs::write(p.join("x"), "file x\n").unwrap();
+    fs::write(p.join("run.sh"), "#!/bin/sh\n").unwrap();
+    fs::set_permissions(p.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("x", p.join("link")).unwrap();
+    fs::create_dir_all(p.join("target")).unwrap();
+    fs::write(p.join("target/artifact"), "keep me").unwrap();
+    let eng = Engine::open_in(home.path(), p).unwrap();
+    let a = eng.world.snapshot().unwrap();
+    // B: x becomes a directory, d/ goes away, run.sh loses its exec bit, link points elsewhere.
+    fs::remove_file(p.join("x")).unwrap();
+    fs::create_dir_all(p.join("x")).unwrap();
+    fs::write(p.join("x/inner"), "inner\n").unwrap();
+    fs::remove_dir_all(p.join("d")).unwrap();
+    fs::set_permissions(p.join("run.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+    fs::remove_file(p.join("link")).unwrap();
+    std::os::unix::fs::symlink("run.sh", p.join("link")).unwrap();
+    let b = eng.world.snapshot().unwrap();
+    assert_ne!(a, b);
+    assert_eq!(eng.world.checkout(&a).unwrap(), b);
+    assert_eq!(eng.world.snapshot().unwrap(), a);
+    assert_eq!(eng.world.git_snapshot().unwrap(), a);
+    assert_eq!(fs::read_to_string(p.join("x")).unwrap(), "file x\n");
+    assert!(fs::metadata(p.join("run.sh")).unwrap().permissions().mode() & 0o100 != 0);
+    assert_eq!(fs::read_link(p.join("link")).unwrap(), std::path::PathBuf::from("x"));
+    assert_eq!(fs::read_to_string(p.join("target/artifact")).unwrap(), "keep me", "ignored files untouched");
+    eng.world.checkout(&b).unwrap();
+    assert_eq!(eng.world.snapshot().unwrap(), b);
+    assert!(!p.join("d").exists(), "emptied directories are pruned");
+}
